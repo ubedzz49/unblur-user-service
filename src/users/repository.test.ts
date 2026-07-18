@@ -27,4 +27,22 @@ describe("InMemoryUserRepository", () => {
     const repo = new InMemoryUserRepository();
     expect(await repo.findById("nonexistent")).toBeNull();
   });
+
+  it("updates only the fields provided, leaves the rest alone", async () => {
+    const repo = new InMemoryUserRepository();
+    const user = await repo.findOrCreateByIdentifier("student@example.com", true);
+
+    const afterFirstUpdate = await repo.updateProfile(user.id, { name: "Asha" });
+    expect(afterFirstUpdate?.name).toBe("Asha");
+    expect(afterFirstUpdate?.bio).toBeNull();
+
+    const afterSecondUpdate = await repo.updateProfile(user.id, { bio: "Maths tutor" });
+    expect(afterSecondUpdate?.name).toBe("Asha");
+    expect(afterSecondUpdate?.bio).toBe("Maths tutor");
+  });
+
+  it("updateProfile returns null for an unknown user", async () => {
+    const repo = new InMemoryUserRepository();
+    expect(await repo.updateProfile("nonexistent", { name: "Asha" })).toBeNull();
+  });
 });
