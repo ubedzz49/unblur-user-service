@@ -1,8 +1,9 @@
-import Fastify, { FastifyInstance } from "fastify";
+import Fastify, { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { OtpStore, InMemoryOtpStore } from "./otp/store.js";
 import { OtpService } from "./otp/service.js";
-import { signAuthToken } from "./jwt.js";
+import { signAuthToken, verifyAuthToken } from "./jwt.js";
 import { EmailSender, RecordingEmailSender } from "./email/sender.js";
+import { UserRepository, InMemoryUserRepository } from "./users/repository.js";
 
 interface SendOtpBody {
   identifier: string;
@@ -15,9 +16,26 @@ interface VerifyOtpBody {
 
 const EMAIL_PATTERN = /^\S+@\S+\.\S+$/;
 
+async function requireAuth(request: FastifyRequest, reply: FastifyReply): Promise<string | undefined> {
+  const header = request.headers.authorization;
+  const token = header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : undefined;
+  if (!token) {
+    reply.code(401).send({ error: "missing bearer token" });
+    return undefined;
+  }
+
+  try {
+    return verifyAuthToken(token).sub;
+  } catch {
+    reply.code(401).send({ error: "invalid or expired token" });
+    return undefined;
+  }
+}
+
 export function buildApp(
   otpStore: OtpStore = new InMemoryOtpStore(),
   emailSender: EmailSender = new RecordingEmailSender(),
+  userRepository: UserRepository = new InMemoryUserRepository(),
 ): FastifyInstance {
   const app = Fastify();
   const otpService = new OtpService(otpStore);
@@ -61,8 +79,22 @@ export function buildApp(
       return reply.code(401).send({ error: "invalid or expired otp" });
     }
 
-    const token = signAuthToken(identifier);
+    const isEmail = EMAIL_PATTERN.test(identifier);
+    const user = await userRepository.findOrCreateByIdentifier(identifier, isEmail);
+
+    const token = signAuthToken(user.id);
     return reply.send({ token });
+  });
+
+  app.get("/users/me", async (request, reply) => {
+    const userId = await requireAuth(request, reply);
+    if (!userId) return;
+
+    const user = await userRepository.findById(userId);
+    if (!user) {
+      return reply.code(404).send({ error: "user not found" });
+    }
+    return reply.send(user);
   });
 
   return app;

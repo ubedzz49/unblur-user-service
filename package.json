@@ -7,17 +7,20 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
+    "migrate": "tsx src/db/migrate.ts",
     "test": "vitest run"
   },
   "dependencies": {
     "@sendgrid/mail": "^8.1.6",
     "fastify": "^5.0.0",
     "ioredis": "^5.11.1",
-    "jsonwebtoken": "^9.0.3"
+    "jsonwebtoken": "^9.0.3",
+    "pg": "^8.22.0"
   },
   "devDependencies": {
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^22.0.0",
+    "@types/pg": "^8.20.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "vitest": "^4.1.10"
