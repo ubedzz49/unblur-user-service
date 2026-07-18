@@ -63,6 +63,8 @@ Apply these by default, not just when asked:
   - Split unrelated changes into separate commits rather than one mega-commit.
   - Example pattern: `fix: recording ttl job skipped rows with pending complaints` / `refactor: extract fee-split calc into shared helper`.
 - Open the PR against the feature branch → base branch (`main`, confirm per repo), and don't merge payment/auth/recording-touching PRs without a human approval, per the security rules above.
+- **PR titles and descriptions are for outside readers, not internal shorthand.** Never put our internal track codes (A3, K2, B4, etc.) or roadmap doc filenames in a PR title or description — nobody outside this project knows what those mean, and they don't age well either. Say what the PR actually does in plain words instead, e.g. "Add OTP send and verify with email delivery" not "A3: OTP flow (see ROADMAP_UNBLUR.md)". It's fine to keep tracking those codes in STATUS.md or in your own head, just not in anything GitHub-facing.
+- **Keep PR descriptions brief and in plain human writing.** A few short sentences or a short bullet list is enough: what changed, and how it was tested. Don't write like a spec document. Avoid the double-dash (`--`) as a sentence-joiner or aside marker — write normal sentences instead ("note: X" or a period and a new sentence, not "X -- Y").
 
 ## 5. CI/CD — every repo, every commit
 
