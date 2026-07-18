@@ -10,6 +10,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@sendgrid/mail": "^8.1.6",
     "fastify": "^5.0.0",
     "ioredis": "^5.11.1",
     "jsonwebtoken": "^9.0.3"
