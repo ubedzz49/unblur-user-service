@@ -3,6 +3,7 @@ import { buildApp } from "./app.js";
 import { InMemoryOtpStore } from "./otp/store.js";
 import { RecordingEmailSender } from "./email/sender.js";
 import { InMemoryUserRepository } from "./users/repository.js";
+import { signAuthToken } from "./jwt.js";
 
 describe("GET /healthz", () => {
   it("returns ok status", async () => {
@@ -156,6 +157,38 @@ describe("GET /users/me", () => {
   it("rejects an invalid token", async () => {
     const app = buildApp();
     const res = await app.inject({ method: "GET", url: "/users/me", headers: { authorization: "Bearer garbage" } });
+    expect(res.statusCode).toBe(401);
+  });
+});
+
+describe("PATCH /users/me", () => {
+  beforeAll(() => {
+    process.env.JWT_SECRET = "test-secret";
+  });
+
+  it("updates the provided fields and leaves the rest untouched", async () => {
+    const userRepo = new InMemoryUserRepository();
+    const app = buildApp(new InMemoryOtpStore(), new RecordingEmailSender(), userRepo);
+
+    const user = await userRepo.findOrCreateByIdentifier("student@example.com", true);
+    const token = signAuthToken(user.id);
+
+    const res = await app.inject({
+      method: "PATCH",
+      url: "/users/me",
+      headers: { authorization: `Bearer ${token}` },
+      payload: { name: "Asha", bio: "Maths tutor" },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().name).toBe("Asha");
+    expect(res.json().bio).toBe("Maths tutor");
+    expect(res.json().email).toBe("student@example.com");
+  });
+
+  it("rejects with no token", async () => {
+    const app = buildApp();
+    const res = await app.inject({ method: "PATCH", url: "/users/me", payload: { name: "Asha" } });
     expect(res.statusCode).toBe(401);
   });
 });

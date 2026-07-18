@@ -3,7 +3,7 @@ import { OtpStore, InMemoryOtpStore } from "./otp/store.js";
 import { OtpService } from "./otp/service.js";
 import { signAuthToken, verifyAuthToken } from "./jwt.js";
 import { EmailSender, RecordingEmailSender } from "./email/sender.js";
-import { UserRepository, InMemoryUserRepository } from "./users/repository.js";
+import { UserRepository, InMemoryUserRepository, ProfileUpdate } from "./users/repository.js";
 
 interface SendOtpBody {
   identifier: string;
@@ -95,6 +95,23 @@ export function buildApp(
       return reply.code(404).send({ error: "user not found" });
     }
     return reply.send(user);
+  });
+
+  app.patch<{ Body: ProfileUpdate }>("/users/me", async (request, reply) => {
+    const userId = await requireAuth(request, reply);
+    if (!userId) return;
+
+    const { name, photoUrl, bio, aiNotesAndTranscriptsEnabled } = request.body ?? {};
+    const updated = await userRepository.updateProfile(userId, {
+      name,
+      photoUrl,
+      bio,
+      aiNotesAndTranscriptsEnabled,
+    });
+    if (!updated) {
+      return reply.code(404).send({ error: "user not found" });
+    }
+    return reply.send(updated);
   });
 
   return app;
