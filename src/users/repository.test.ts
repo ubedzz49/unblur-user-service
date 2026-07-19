@@ -8,9 +8,11 @@ describe("InMemoryUserRepository", () => {
     const first = await repo.findOrCreateByIdentifier("student@example.com", true);
     const second = await repo.findOrCreateByIdentifier("student@example.com", true);
 
-    expect(second.id).toBe(first.id);
-    expect(first.email).toBe("student@example.com");
-    expect(first.phone).toBeNull();
+    expect(first.isNew).toBe(true);
+    expect(second.isNew).toBe(false);
+    expect(second.user.id).toBe(first.user.id);
+    expect(first.user.email).toBe("student@example.com");
+    expect(first.user.phone).toBeNull();
   });
 
   it("keeps email and phone identifiers as separate users", async () => {
@@ -19,8 +21,8 @@ describe("InMemoryUserRepository", () => {
     const emailUser = await repo.findOrCreateByIdentifier("student@example.com", true);
     const phoneUser = await repo.findOrCreateByIdentifier("+911234567890", false);
 
-    expect(emailUser.id).not.toBe(phoneUser.id);
-    expect(phoneUser.phone).toBe("+911234567890");
+    expect(emailUser.user.id).not.toBe(phoneUser.user.id);
+    expect(phoneUser.user.phone).toBe("+911234567890");
   });
 
   it("findById returns null for an unknown id", async () => {
@@ -30,7 +32,7 @@ describe("InMemoryUserRepository", () => {
 
   it("updates only the fields provided, leaves the rest alone", async () => {
     const repo = new InMemoryUserRepository();
-    const user = await repo.findOrCreateByIdentifier("student@example.com", true);
+    const { user } = await repo.findOrCreateByIdentifier("student@example.com", true);
 
     const afterFirstUpdate = await repo.updateProfile(user.id, { name: "Asha" });
     expect(afterFirstUpdate?.name).toBe("Asha");

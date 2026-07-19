@@ -1,5 +1,5 @@
 import { Pool } from "pg";
-import { ProfileUpdate, User, UserRepository } from "./repository.js";
+import { FindOrCreateResult, ProfileUpdate, User, UserRepository } from "./repository.js";
 
 interface UserRow {
   id: string;
@@ -28,17 +28,23 @@ function toUser(row: UserRow): User {
 export class PostgresUserRepository implements UserRepository {
   constructor(private pool: Pool) {}
 
-  async findOrCreateByIdentifier(identifier: string, isEmail: boolean): Promise<User> {
+  async findOrCreateByIdentifier(identifier: string, isEmail: boolean): Promise<FindOrCreateResult> {
     const column = isEmail ? "email" : "phone";
 
     const existing = await this.pool.query<UserRow>(`SELECT * FROM users WHERE ${column} = $1`, [identifier]);
-    if (existing.rows.length > 0) return toUser(existing.rows[0]);
+    if (existing.rows.length > 0) return { user: toUser(existing.rows[0]), isNew: false };
 
+    // ON CONFLICT DO NOTHING -- two concurrent first-time logins for the same identifier
+    // can both reach here past the SELECT above; only one insert should win
     const inserted = await this.pool.query<UserRow>(
-      `INSERT INTO users (${column}) VALUES ($1) RETURNING *`,
+      `INSERT INTO users (${column}) VALUES ($1) ON CONFLICT (${column}) DO NOTHING RETURNING *`,
       [identifier],
     );
-    return toUser(inserted.rows[0]);
+    if (inserted.rows.length > 0) return { user: toUser(inserted.rows[0]), isNew: true };
+
+    // lost the race -- the other request's insert won, fetch what it created
+    const afterConflict = await this.pool.query<UserRow>(`SELECT * FROM users WHERE ${column} = $1`, [identifier]);
+    return { user: toUser(afterConflict.rows[0]), isNew: false };
   }
 
   async findById(id: string): Promise<User | null> {
