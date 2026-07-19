@@ -192,3 +192,53 @@ describe("PATCH /users/me", () => {
     expect(res.statusCode).toBe(401);
   });
 });
+
+describe("POST /users/me/photo-upload-url", () => {
+  beforeAll(() => {
+    process.env.JWT_SECRET = "test-secret";
+  });
+
+  it("returns an upload url and a public url for an allowed content type", async () => {
+    const userRepo = new InMemoryUserRepository();
+    const app = buildApp(new InMemoryOtpStore(), new RecordingEmailSender(), userRepo);
+    const user = await userRepo.findOrCreateByIdentifier("student@example.com", true);
+    const token = signAuthToken(user.id);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/users/me/photo-upload-url",
+      headers: { authorization: `Bearer ${token}` },
+      payload: { contentType: "image/png" },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().uploadUrl).toBeTypeOf("string");
+    expect(res.json().publicUrl).toBeTypeOf("string");
+  });
+
+  it("rejects an unsupported content type", async () => {
+    const userRepo = new InMemoryUserRepository();
+    const app = buildApp(new InMemoryOtpStore(), new RecordingEmailSender(), userRepo);
+    const user = await userRepo.findOrCreateByIdentifier("student@example.com", true);
+    const token = signAuthToken(user.id);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/users/me/photo-upload-url",
+      headers: { authorization: `Bearer ${token}` },
+      payload: { contentType: "application/pdf" },
+    });
+
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects with no token", async () => {
+    const app = buildApp();
+    const res = await app.inject({
+      method: "POST",
+      url: "/users/me/photo-upload-url",
+      payload: { contentType: "image/png" },
+    });
+    expect(res.statusCode).toBe(401);
+  });
+});

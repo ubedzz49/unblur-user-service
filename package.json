@@ -11,6 +11,8 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1090.0",
+    "@aws-sdk/s3-request-presigner": "^3.1090.0",
     "@sendgrid/mail": "^8.1.6",
     "fastify": "^5.0.0",
     "ioredis": "^5.11.1",
