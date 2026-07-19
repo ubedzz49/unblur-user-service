@@ -3,6 +3,7 @@ import { buildApp } from "./app.js";
 import { InMemoryOtpStore } from "./otp/store.js";
 import { RecordingEmailSender } from "./email/sender.js";
 import { InMemoryUserRepository } from "./users/repository.js";
+import { InMemoryStatsRepository } from "./stats/repository.js";
 import { InMemoryExpertiseRepository } from "./expertise/repository.js";
 import { FakeMatchingClient, MatchingClient } from "./matching/client.js";
 import { signAuthToken } from "./jwt.js";
@@ -486,5 +487,360 @@ describe("POST /expertise-options/custom", () => {
       payload: { subjectName: "DSA" },
     });
     expect(res.statusCode).toBe(401);
+  });
+});
+
+describe("GET /users/me/stats", () => {
+  beforeAll(() => {
+    process.env.JWT_SECRET = "test-secret";
+  });
+
+  function build() {
+    const userRepo = new InMemoryUserRepository();
+    const statsRepo = new InMemoryStatsRepository();
+    const app = buildApp(
+      new InMemoryOtpStore(),
+      new RecordingEmailSender(),
+      userRepo,
+      undefined,
+      new InMemoryExpertiseRepository(),
+      new FakeMatchingClient(),
+      statsRepo,
+    );
+    return { app, userRepo, statsRepo };
+  }
+
+  it("returns zeros for a brand-new user", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("student@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+    const token = signAuthToken(user.id);
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/users/me/stats",
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({
+      minutesResolved: 0,
+      avgRating: 0,
+      ratingCount: 0,
+      minutesListener: 0,
+      updatedAt: expect.any(String),
+    });
+  });
+
+  it("returns 404 rather than crashing if a stats row is somehow missing", async () => {
+    const { app, userRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("student@example.com", true);
+    const token = signAuthToken(user.id);
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/users/me/stats",
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(404);
+    expect(res.json()).toEqual({ error: "stats not found" });
+  });
+
+  it("rejects with no token", async () => {
+    const { app } = build();
+    const res = await app.inject({ method: "GET", url: "/users/me/stats" });
+    expect(res.statusCode).toBe(401);
+  });
+});
+
+describe("GET /users/:id/public", () => {
+  beforeAll(() => {
+    process.env.JWT_SECRET = "test-secret";
+  });
+
+  function build() {
+    const userRepo = new InMemoryUserRepository();
+    const statsRepo = new InMemoryStatsRepository();
+    const app = buildApp(
+      new InMemoryOtpStore(),
+      new RecordingEmailSender(),
+      userRepo,
+      undefined,
+      new InMemoryExpertiseRepository(),
+      new FakeMatchingClient(),
+      statsRepo,
+    );
+    return { app, userRepo, statsRepo };
+  }
+
+  it("returns the minimal public view for another user", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user: caller } = await userRepo.findOrCreateByIdentifier("caller@example.com", true);
+    const { user: target } = await userRepo.findOrCreateByIdentifier("target@example.com", true);
+    await statsRepo.initializeForUser(target.id);
+    await userRepo.updateProfile(target.id, { name: "Asha", photoUrl: "https://cdn/asha.png", bio: "secret bio" });
+    const token = signAuthToken(caller.id);
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/users/${target.id}/public`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body).toEqual({
+      id: target.id,
+      name: "Asha",
+      photoUrl: "https://cdn/asha.png",
+      stats: { minutesResolved: 0, avgRating: 0, ratingCount: 0, minutesListener: 0 },
+    });
+    // privacy boundary -- these must never appear in the public view
+    expect(Object.keys(body)).not.toContain("email");
+    expect(Object.keys(body)).not.toContain("phone");
+    expect(Object.keys(body)).not.toContain("bio");
+    expect(JSON.stringify(body)).not.toContain("secret bio");
+  });
+
+  it("returns 404 for a nonexistent but well-formed id", async () => {
+    const { app, userRepo } = build();
+    const { user: caller } = await userRepo.findOrCreateByIdentifier("caller@example.com", true);
+    const token = signAuthToken(caller.id);
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/users/00000000-0000-4000-8000-000000000000/public",
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("returns 400 for a malformed id", async () => {
+    const { app, userRepo } = build();
+    const { user: caller } = await userRepo.findOrCreateByIdentifier("caller@example.com", true);
+    const token = signAuthToken(caller.id);
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/users/not-a-uuid/public",
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects with no token", async () => {
+    const { app } = build();
+    const res = await app.inject({
+      method: "GET",
+      url: "/users/00000000-0000-4000-8000-000000000000/public",
+    });
+    expect(res.statusCode).toBe(401);
+  });
+});
+
+describe("POST /internal/users/:id/stats/increment-minutes-resolved", () => {
+  const originalInternalToken = process.env.INTERNAL_SERVICE_TOKEN;
+
+  beforeAll(() => {
+    process.env.JWT_SECRET = "test-secret";
+    process.env.INTERNAL_SERVICE_TOKEN = "test-internal-secret";
+  });
+
+  afterAll(() => {
+    process.env.INTERNAL_SERVICE_TOKEN = originalInternalToken;
+  });
+
+  function build() {
+    const userRepo = new InMemoryUserRepository();
+    const statsRepo = new InMemoryStatsRepository();
+    const app = buildApp(
+      new InMemoryOtpStore(),
+      new RecordingEmailSender(),
+      userRepo,
+      undefined,
+      new InMemoryExpertiseRepository(),
+      new FakeMatchingClient(),
+      statsRepo,
+    );
+    return { app, userRepo, statsRepo };
+  }
+
+  it("succeeds with the correct internal token and increments correctly", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("resolver@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/internal/users/${user.id}/stats/increment-minutes-resolved`,
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { minutes: 30 },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ minutesResolved: 30 });
+
+    const again = await app.inject({
+      method: "POST",
+      url: `/internal/users/${user.id}/stats/increment-minutes-resolved`,
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { minutes: 15 },
+    });
+    expect(again.statusCode).toBe(200);
+    expect(again.json()).toEqual({ minutesResolved: 45 });
+  });
+
+  it("rejects a request with no internal token header", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("resolver@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/internal/users/${user.id}/stats/increment-minutes-resolved`,
+      payload: { minutes: 30 },
+    });
+
+    expect(res.statusCode).toBe(401);
+    expect(res.json()).toEqual({ error: "invalid internal service token" });
+  });
+
+  it("rejects a request with the wrong internal token value", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("resolver@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/internal/users/${user.id}/stats/increment-minutes-resolved`,
+      headers: { "x-internal-service-token": "totally-wrong" },
+      payload: { minutes: 30 },
+    });
+
+    expect(res.statusCode).toBe(401);
+  });
+
+  // the core security property: a real, validly-signed end-user jwt must not work here --
+  // this endpoint is service-to-service only, no user has a legitimate reason to call it
+  it("rejects a request using a valid user JWT instead of the internal token", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("resolver@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+    const userToken = signAuthToken(user.id);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/internal/users/${user.id}/stats/increment-minutes-resolved`,
+      headers: { authorization: `Bearer ${userToken}` },
+      payload: { minutes: 30 },
+    });
+
+    expect(res.statusCode).toBe(401);
+    const stats = await statsRepo.findByUserId(user.id);
+    expect(stats?.minutesResolved).toBe(0);
+  });
+
+  it("rejects a negative minutes value", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("resolver@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/internal/users/${user.id}/stats/increment-minutes-resolved`,
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { minutes: -5 },
+    });
+
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects a zero minutes value", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("resolver@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/internal/users/${user.id}/stats/increment-minutes-resolved`,
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { minutes: 0 },
+    });
+
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects a non-integer minutes value", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("resolver@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/internal/users/${user.id}/stats/increment-minutes-resolved`,
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { minutes: 12.5 },
+    });
+
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects a non-numeric minutes value", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("resolver@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/internal/users/${user.id}/stats/increment-minutes-resolved`,
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { minutes: "thirty" },
+    });
+
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects an unreasonably large minutes value", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("resolver@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/internal/users/${user.id}/stats/increment-minutes-resolved`,
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { minutes: 1441 },
+    });
+
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("returns 404 for a nonexistent target user id even with a valid internal token", async () => {
+    const { app } = build();
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/internal/users/00000000-0000-4000-8000-000000000000/stats/increment-minutes-resolved",
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { minutes: 30 },
+    });
+
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("returns 400 for a malformed target user id", async () => {
+    const { app } = build();
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/internal/users/not-a-uuid/stats/increment-minutes-resolved",
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { minutes: 30 },
+    });
+
+    expect(res.statusCode).toBe(400);
   });
 });

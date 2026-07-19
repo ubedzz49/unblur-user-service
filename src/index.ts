@@ -7,9 +7,16 @@ import { PostgresUserRepository } from "./users/postgres-repository.js";
 import { logger } from "./logger.js";
 import { S3PhotoUploadUrlProvider } from "./photos/s3-upload-url.js";
 import { PostgresExpertiseRepository } from "./expertise/postgres-repository.js";
+import { PostgresStatsRepository } from "./stats/postgres-repository.js";
+import { HttpMatchingClient } from "./matching/client.js";
+import { requireInternalServiceTokenConfigured } from "./internal-auth.js";
 
 const port = Number(process.env.PORT ?? 3000);
 const dbPool = buildDbPool();
+
+// fail closed at startup, same philosophy as JWT_SECRET -- never boot with the internal
+// route silently accepting everything because this secret was never configured
+requireInternalServiceTokenConfigured();
 
 runMigrations(dbPool)
   .then(() => {
@@ -19,6 +26,8 @@ runMigrations(dbPool)
       new PostgresUserRepository(dbPool),
       new S3PhotoUploadUrlProvider(),
       new PostgresExpertiseRepository(dbPool),
+      new HttpMatchingClient(),
+      new PostgresStatsRepository(dbPool),
     );
 
     return app.listen({ port, host: "0.0.0.0" }).then(() => app.log.info({ port }, "user-service listening"));

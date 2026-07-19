@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 export interface User {
   id: string;
   email: string | null;
@@ -44,13 +46,14 @@ export class InMemoryUserRepository implements UserRepository {
   private usersById = new Map<string, User>();
   private idsByIdentifier = new Map<string, string>();
   private passwordsById = new Map<string, { passwordHash: string | null; mustResetPassword: boolean }>();
-  private nextId = 1;
 
   async findOrCreateByIdentifier(identifier: string, isEmail: boolean): Promise<FindOrCreateResult> {
     const existingId = this.idsByIdentifier.get(identifier);
     if (existingId) return { user: this.usersById.get(existingId)!, isNew: false };
 
-    const id = `test-user-${this.nextId++}`;
+    // real uuid, not a placeholder string -- some endpoints (GET /users/:id/public) validate
+    // the id looks like a real uuid before querying, so tests need a realistic shape here too
+    const id = randomUUID();
     const user: User = {
       id,
       email: isEmail ? identifier : null,
