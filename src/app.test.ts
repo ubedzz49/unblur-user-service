@@ -3,6 +3,7 @@ import { buildApp } from "./app.js";
 import { InMemoryOtpStore } from "./otp/store.js";
 import { RecordingEmailSender } from "./email/sender.js";
 import { InMemoryUserRepository } from "./users/repository.js";
+import { InMemoryExpertiseRepository } from "./expertise/repository.js";
 import { signAuthToken } from "./jwt.js";
 
 describe("GET /healthz", () => {
@@ -243,6 +244,123 @@ describe("POST /users/me/photo-upload-url", () => {
       url: "/users/me/photo-upload-url",
       payload: { contentType: "image/png" },
     });
+    expect(res.statusCode).toBe(401);
+  });
+});
+
+describe("expertise endpoints", () => {
+  beforeAll(() => {
+    process.env.JWT_SECRET = "test-secret";
+  });
+
+  it("lists the available expertise options with no auth required", async () => {
+    const app = buildApp(new InMemoryOtpStore(), new RecordingEmailSender(), new InMemoryUserRepository());
+    const res = await app.inject({ method: "GET", url: "/expertise-options" });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().some((o: { slug: string }) => o.slug === "maths")).toBe(true);
+  });
+
+  it("adds an expertise entry for the current user and lists it back", async () => {
+    const userRepo = new InMemoryUserRepository();
+    const expertiseRepo = new InMemoryExpertiseRepository();
+    const app = buildApp(
+      new InMemoryOtpStore(),
+      new RecordingEmailSender(),
+      userRepo,
+      undefined,
+      expertiseRepo,
+    );
+    const { user } = await userRepo.findOrCreateByIdentifier("student@example.com", true);
+    const token = signAuthToken(user.id);
+
+    const addRes = await app.inject({
+      method: "POST",
+      url: "/users/me/expertise",
+      headers: { authorization: `Bearer ${token}` },
+      payload: { expertiseTypeId: "type-maths", expertiseLevelId: "level-class-12" },
+    });
+    expect(addRes.statusCode).toBe(201);
+
+    const listRes = await app.inject({
+      method: "GET",
+      url: "/users/me/expertise",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(listRes.statusCode).toBe(200);
+    expect(listRes.json()).toHaveLength(1);
+    expect(listRes.json()[0].expertiseTypeName).toBe("Maths");
+  });
+
+  it("rejects adding the same expertise twice with a 409", async () => {
+    const userRepo = new InMemoryUserRepository();
+    const expertiseRepo = new InMemoryExpertiseRepository();
+    const app = buildApp(
+      new InMemoryOtpStore(),
+      new RecordingEmailSender(),
+      userRepo,
+      undefined,
+      expertiseRepo,
+    );
+    const { user } = await userRepo.findOrCreateByIdentifier("student@example.com", true);
+    const token = signAuthToken(user.id);
+    const payload = { expertiseTypeId: "type-maths", expertiseLevelId: "level-class-12" };
+
+    await app.inject({
+      method: "POST",
+      url: "/users/me/expertise",
+      headers: { authorization: `Bearer ${token}` },
+      payload,
+    });
+    const secondRes = await app.inject({
+      method: "POST",
+      url: "/users/me/expertise",
+      headers: { authorization: `Bearer ${token}` },
+      payload,
+    });
+
+    expect(secondRes.statusCode).toBe(409);
+  });
+
+  it("removes an expertise entry", async () => {
+    const userRepo = new InMemoryUserRepository();
+    const expertiseRepo = new InMemoryExpertiseRepository();
+    const app = buildApp(
+      new InMemoryOtpStore(),
+      new RecordingEmailSender(),
+      userRepo,
+      undefined,
+      expertiseRepo,
+    );
+    const { user } = await userRepo.findOrCreateByIdentifier("student@example.com", true);
+    const token = signAuthToken(user.id);
+
+    const addRes = await app.inject({
+      method: "POST",
+      url: "/users/me/expertise",
+      headers: { authorization: `Bearer ${token}` },
+      payload: { expertiseTypeId: "type-maths", expertiseLevelId: "level-class-12" },
+    });
+    const entryId = addRes.json().id;
+
+    const deleteRes = await app.inject({
+      method: "DELETE",
+      url: `/users/me/expertise/${entryId}`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(deleteRes.statusCode).toBe(204);
+
+    const listRes = await app.inject({
+      method: "GET",
+      url: "/users/me/expertise",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(listRes.json()).toHaveLength(0);
+  });
+
+  it("rejects with no token", async () => {
+    const app = buildApp();
+    const res = await app.inject({ method: "GET", url: "/users/me/expertise" });
     expect(res.statusCode).toBe(401);
   });
 });
