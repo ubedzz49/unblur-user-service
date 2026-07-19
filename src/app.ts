@@ -400,12 +400,20 @@ export function buildApp(
       request.log.warn({ requestedId: id }, "public profile fetch failed: no stats row");
       return reply.code(404).send({ error: "user not found" });
     }
+    const expertise = await expertiseRepository.listForUser(id);
 
-    // deliberately minimal -- no email/phone/bio, this is a privacy boundary not an oversight
+    // no email/phone -- that stays private, but bio and expertise help the other side of a
+    // resolution request decide whether to accept/send
     return reply.send({
       id: user.id,
       name: user.name,
       photoUrl: user.photoUrl,
+      bio: user.bio,
+      expertise: expertise.map((e) => ({
+        id: e.id,
+        expertiseTypeName: e.expertiseTypeName,
+        expertiseLevelName: e.expertiseLevelName,
+      })),
       stats: {
         minutesResolved: stats.minutesResolved,
         avgRating: stats.avgRating,
