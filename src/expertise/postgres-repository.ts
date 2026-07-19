@@ -1,10 +1,15 @@
 import { Pool } from "pg";
 import {
+  CustomExpertiseResult,
   DuplicateExpertiseError,
   ExpertiseOptionNotFoundError,
   ExpertiseRepository,
   ExpertiseTypeOption,
+  GENERAL_LEVEL_NAME,
+  GENERAL_LEVEL_SLUG,
+  USER_SUBMITTED_TYPE,
   UserExpertiseEntry,
+  slugify,
 } from "./repository.js";
 
 const UNIQUE_VIOLATION = "23505";
@@ -95,5 +100,87 @@ export class PostgresExpertiseRepository implements ExpertiseRepository {
       userId,
     ]);
     return (result.rowCount ?? 0) > 0;
+  }
+
+  async findOrCreateCustom(subjectName: string, levelName?: string): Promise<CustomExpertiseResult> {
+    const trimmedSubject = subjectName.trim();
+    const subjectSlug = slugify(trimmedSubject);
+
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // expertise_types.slug is globally UNIQUE across every category, not just
+      // user-submitted -- e.g. migration 003 already seeded academic "Data Structures and
+      // Algorithms" under slug 'dsa'. A user typing "DSA" must not attach to or clobber that
+      // unrelated curated row. Resolve a canonical slug to use for this subject first: if the
+      // "natural" slug is already taken by some other (non-user-submitted) category, fall back
+      // to a deterministic suffixed variant. This resolution only depends on stable, pre-existing
+      // curated rows, so it produces the *same* canonical slug every time this subject is
+      // looked up -- which is what makes find-then-create idempotent across calls.
+      let canonicalSlug = subjectSlug;
+      for (let suffix = 1; ; suffix++) {
+        const collision = await client.query(
+          `SELECT 1 FROM expertise_types WHERE lower(slug) = lower($1) AND type != $2`,
+          [canonicalSlug, USER_SUBMITTED_TYPE],
+        );
+        if (collision.rowCount === 0) break;
+        canonicalSlug = `${subjectSlug}-user-submitted${suffix > 1 ? `-${suffix}` : ""}`;
+      }
+
+      let typeRow = (
+        await client.query<{ id: string; name: string }>(
+          `SELECT id, name FROM expertise_types WHERE type = $1 AND lower(slug) = lower($2)`,
+          [USER_SUBMITTED_TYPE, canonicalSlug],
+        )
+      ).rows[0];
+
+      if (!typeRow) {
+        typeRow = (
+          await client.query<{ id: string; name: string }>(
+            `INSERT INTO expertise_types (type, name, slug) VALUES ($1, $2, $3)
+             ON CONFLICT (slug) DO UPDATE SET slug = EXCLUDED.slug
+             RETURNING id, name`,
+            [USER_SUBMITTED_TYPE, trimmedSubject, canonicalSlug],
+          )
+        ).rows[0];
+      }
+
+      const trimmedLevel = levelName?.trim();
+      const levelSlug = trimmedLevel ? slugify(trimmedLevel) : GENERAL_LEVEL_SLUG;
+      const levelName_ = trimmedLevel || GENERAL_LEVEL_NAME;
+
+      let levelRow = (
+        await client.query<{ id: string; name: string }>(
+          `SELECT id, name FROM expertise_levels WHERE expertise_type_id = $1 AND lower(slug) = lower($2)`,
+          [typeRow.id, levelSlug],
+        )
+      ).rows[0];
+
+      if (!levelRow) {
+        levelRow = (
+          await client.query<{ id: string; name: string }>(
+            `INSERT INTO expertise_levels (expertise_type_id, name, slug) VALUES ($1, $2, $3)
+             ON CONFLICT (expertise_type_id, slug) DO UPDATE SET slug = EXCLUDED.slug
+             RETURNING id, name`,
+            [typeRow.id, levelName_, levelSlug],
+          )
+        ).rows[0];
+      }
+
+      await client.query("COMMIT");
+
+      return {
+        expertiseTypeId: typeRow.id,
+        expertiseLevelId: levelRow.id,
+        typeName: typeRow.name,
+        levelName: levelRow.name,
+      };
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 }

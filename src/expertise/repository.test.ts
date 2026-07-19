@@ -55,4 +55,37 @@ describe("InMemoryExpertiseRepository", () => {
     const repo = new InMemoryExpertiseRepository();
     expect(await repo.removeForUser("user-1", "nonexistent")).toBe(false);
   });
+
+  it("creates a brand-new custom subject and level", async () => {
+    const repo = new InMemoryExpertiseRepository();
+    const result = await repo.findOrCreateCustom("DSA", "Beginner");
+
+    expect(result.typeName).toBe("DSA");
+    expect(result.levelName).toBe("Beginner");
+    expect(result.expertiseTypeId).toBeTruthy();
+    expect(result.expertiseLevelId).toBeTruthy();
+
+    const options = await repo.listOptions();
+    const type = options.find((o) => o.id === result.expertiseTypeId);
+    expect(type?.type).toBe("user-submitted");
+    expect(type?.slug).toBe("dsa");
+  });
+
+  it("reuses an existing custom subject by slug on a second call", async () => {
+    const repo = new InMemoryExpertiseRepository();
+    const first = await repo.findOrCreateCustom("DSA", "Beginner");
+    const second = await repo.findOrCreateCustom("dsa", "beginner");
+
+    expect(second.expertiseTypeId).toBe(first.expertiseTypeId);
+    expect(second.expertiseLevelId).toBe(first.expertiseLevelId);
+  });
+
+  it("creates and reuses a 'General' level when no levelName is given", async () => {
+    const repo = new InMemoryExpertiseRepository();
+    const first = await repo.findOrCreateCustom("Underwater Basket Weaving");
+    expect(first.levelName).toBe("General");
+
+    const second = await repo.findOrCreateCustom("Underwater Basket Weaving");
+    expect(second.expertiseLevelId).toBe(first.expertiseLevelId);
+  });
 });
