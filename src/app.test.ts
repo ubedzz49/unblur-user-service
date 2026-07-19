@@ -574,12 +574,16 @@ describe("GET /users/:id/public", () => {
     return { app, userRepo, statsRepo };
   }
 
-  it("returns the minimal public view for another user", async () => {
+  it("returns the public view including bio and expertise for another user", async () => {
     const { app, userRepo, statsRepo } = build();
     const { user: caller } = await userRepo.findOrCreateByIdentifier("caller@example.com", true);
     const { user: target } = await userRepo.findOrCreateByIdentifier("target@example.com", true);
     await statsRepo.initializeForUser(target.id);
-    await userRepo.updateProfile(target.id, { name: "Asha", photoUrl: "https://cdn/asha.png", bio: "secret bio" });
+    await userRepo.updateProfile(target.id, {
+      name: "Asha",
+      photoUrl: "https://cdn/asha.png",
+      bio: "I help with CAT quant",
+    });
     const token = signAuthToken(caller.id);
 
     const res = await app.inject({
@@ -594,13 +598,65 @@ describe("GET /users/:id/public", () => {
       id: target.id,
       name: "Asha",
       photoUrl: "https://cdn/asha.png",
+      bio: "I help with CAT quant",
+      expertise: [],
       stats: { minutesResolved: 0, avgRating: 0, ratingCount: 0, minutesListener: 0 },
     });
     // privacy boundary -- these must never appear in the public view
     expect(Object.keys(body)).not.toContain("email");
     expect(Object.keys(body)).not.toContain("phone");
-    expect(Object.keys(body)).not.toContain("bio");
-    expect(JSON.stringify(body)).not.toContain("secret bio");
+  });
+
+  it("returns bio: null when the target user has no bio set", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user: caller } = await userRepo.findOrCreateByIdentifier("caller@example.com", true);
+    const { user: target } = await userRepo.findOrCreateByIdentifier("target@example.com", true);
+    await statsRepo.initializeForUser(target.id);
+    const token = signAuthToken(caller.id);
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/users/${target.id}/public`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().bio).toBeNull();
+  });
+
+  it("maps the target user's tagged expertise to the display shape", async () => {
+    const userRepo = new InMemoryUserRepository();
+    const statsRepo = new InMemoryStatsRepository();
+    const expertiseRepo = new InMemoryExpertiseRepository();
+    const app = buildApp(
+      new InMemoryOtpStore(),
+      new RecordingEmailSender(),
+      userRepo,
+      undefined,
+      expertiseRepo,
+      new FakeMatchingClient(),
+      statsRepo,
+    );
+    const { user: caller } = await userRepo.findOrCreateByIdentifier("caller@example.com", true);
+    const { user: target } = await userRepo.findOrCreateByIdentifier("target@example.com", true);
+    await statsRepo.initializeForUser(target.id);
+    const entry = await expertiseRepo.addForUser(target.id, "type-maths", "level-class-12");
+    const token = signAuthToken(caller.id);
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/users/${target.id}/public`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().expertise).toEqual([
+      {
+        id: entry.id,
+        expertiseTypeName: "Maths",
+        expertiseLevelName: "NCERT Class 12",
+      },
+    ]);
   });
 
   it("returns 404 for a nonexistent but well-formed id", async () => {
