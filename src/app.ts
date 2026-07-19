@@ -9,6 +9,12 @@ import {
   FakePhotoUploadUrlProvider,
   PhotoUploadUrlProvider,
 } from "./photos/upload-url.js";
+import {
+  DuplicateExpertiseError,
+  ExpertiseOptionNotFoundError,
+  ExpertiseRepository,
+  InMemoryExpertiseRepository,
+} from "./expertise/repository.js";
 
 interface SendOtpBody {
   identifier: string;
@@ -21,6 +27,11 @@ interface VerifyOtpBody {
 
 interface PhotoUploadUrlBody {
   contentType: string;
+}
+
+interface AddExpertiseBody {
+  expertiseTypeId: string;
+  expertiseLevelId: string;
 }
 
 const EMAIL_PATTERN = /^\S+@\S+\.\S+$/;
@@ -48,6 +59,7 @@ export function buildApp(
   emailSender: EmailSender = new RecordingEmailSender(),
   userRepository: UserRepository = new InMemoryUserRepository(),
   photoUploadUrlProvider: PhotoUploadUrlProvider = new FakePhotoUploadUrlProvider(),
+  expertiseRepository: ExpertiseRepository = new InMemoryExpertiseRepository(),
 ): FastifyInstance {
   // request/response logging is off during tests to keep test output readable --
   // level otherwise configurable via LOG_LEVEL (info by default)
@@ -157,6 +169,57 @@ export function buildApp(
     const { uploadUrl, publicUrl } = await photoUploadUrlProvider.createUploadUrl(userId, contentType);
     request.log.info({ userId }, "photo upload url issued");
     return reply.send({ uploadUrl, publicUrl });
+  });
+
+  app.get("/expertise-options", async () => {
+    return expertiseRepository.listOptions();
+  });
+
+  app.get("/users/me/expertise", async (request, reply) => {
+    const userId = await requireAuth(request, reply);
+    if (!userId) return;
+
+    return expertiseRepository.listForUser(userId);
+  });
+
+  app.post<{ Body: AddExpertiseBody }>("/users/me/expertise", async (request, reply) => {
+    const userId = await requireAuth(request, reply);
+    if (!userId) return;
+
+    const { expertiseTypeId, expertiseLevelId } = request.body ?? {};
+    if (!expertiseTypeId || !expertiseLevelId) {
+      request.log.warn({ userId }, "add expertise rejected: missing type or level");
+      return reply.code(400).send({ error: "expertiseTypeId and expertiseLevelId are required" });
+    }
+
+    try {
+      const entry = await expertiseRepository.addForUser(userId, expertiseTypeId, expertiseLevelId);
+      request.log.info({ userId, expertiseTypeId, expertiseLevelId }, "expertise added");
+      return reply.code(201).send(entry);
+    } catch (err) {
+      if (err instanceof DuplicateExpertiseError) {
+        request.log.warn({ userId, expertiseTypeId, expertiseLevelId }, "add expertise rejected: already added");
+        return reply.code(409).send({ error: "you've already added this expertise and level" });
+      }
+      if (err instanceof ExpertiseOptionNotFoundError) {
+        request.log.warn({ userId, expertiseTypeId, expertiseLevelId }, "add expertise rejected: unknown option");
+        return reply.code(400).send({ error: "unknown expertiseTypeId or expertiseLevelId" });
+      }
+      throw err;
+    }
+  });
+
+  app.delete<{ Params: { id: string } }>("/users/me/expertise/:id", async (request, reply) => {
+    const userId = await requireAuth(request, reply);
+    if (!userId) return;
+
+    const removed = await expertiseRepository.removeForUser(userId, request.params.id);
+    if (!removed) {
+      request.log.warn({ userId, userExpertiseId: request.params.id }, "remove expertise failed: not found");
+      return reply.code(404).send({ error: "not found" });
+    }
+    request.log.info({ userId, userExpertiseId: request.params.id }, "expertise removed");
+    return reply.code(204).send();
   });
 
   return app;
