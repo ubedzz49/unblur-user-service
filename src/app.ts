@@ -17,6 +17,8 @@ import {
   InMemoryExpertiseRepository,
 } from "./expertise/repository.js";
 import { HttpMatchingClient, MatchingClient } from "./matching/client.js";
+import { InMemoryStatsRepository, StatsRepository } from "./stats/repository.js";
+import { requireInternalServiceToken } from "./internal-auth.js";
 
 interface SendOtpBody {
   identifier: string;
@@ -63,6 +65,15 @@ interface CustomExpertiseBody {
 }
 
 const EMAIL_PATTERN = /^\S+@\S+\.\S+$/;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// one calendar day -- anything above this in a single increment is clearly bogus input,
+// not a real completed booking
+const MAX_MINUTES_RESOLVED_PER_CALL = 1440;
+
+interface IncrementMinutesResolvedBody {
+  minutes: number;
+}
 
 async function requireAuth(request: FastifyRequest, reply: FastifyReply): Promise<string | undefined> {
   const header = request.headers.authorization;
@@ -89,6 +100,7 @@ export function buildApp(
   photoUploadUrlProvider: PhotoUploadUrlProvider = new FakePhotoUploadUrlProvider(),
   expertiseRepository: ExpertiseRepository = new InMemoryExpertiseRepository(),
   matchingClient: MatchingClient = new HttpMatchingClient(),
+  statsRepository: StatsRepository = new InMemoryStatsRepository(),
 ): FastifyInstance {
   // request/response logging is off during tests to keep test output readable --
   // level otherwise configurable via LOG_LEVEL (info by default)
@@ -143,6 +155,10 @@ export function buildApp(
 
     const isEmail = EMAIL_PATTERN.test(identifier);
     const { user, isNew } = await userRepository.findOrCreateByIdentifier(identifier, isEmail);
+    // in-memory repo path (real Postgres path already does this in the same db transaction
+    // as the user insert, see PostgresUserRepository.findOrCreateByIdentifier) -- idempotent
+    // either way, so calling it unconditionally is harmless
+    if (isNew) await statsRepository.initializeForUser(user.id);
 
     const token = signAuthToken(user.id);
     request.log.info({ userId: user.id, isNew }, "otp verified, user logged in");
@@ -344,6 +360,97 @@ export function buildApp(
     request.log.info({ userId, userExpertiseId: request.params.id }, "expertise removed");
     return reply.code(204).send();
   });
+
+  app.get("/users/me/stats", async (request, reply) => {
+    const userId = await requireAuth(request, reply);
+    if (!userId) return;
+
+    const stats = await statsRepository.findByUserId(userId);
+    // shouldn't happen given the backfill/on-create guarantee, but don't crash if it does
+    if (!stats) {
+      request.log.warn({ userId }, "stats fetch failed: no stats row");
+      return reply.code(404).send({ error: "stats not found" });
+    }
+    return reply.send({
+      minutesResolved: stats.minutesResolved,
+      avgRating: stats.avgRating,
+      ratingCount: stats.ratingCount,
+      minutesListener: stats.minutesListener,
+      updatedAt: stats.updatedAt,
+    });
+  });
+
+  app.get<{ Params: { id: string } }>("/users/:id/public", async (request, reply) => {
+    const userId = await requireAuth(request, reply);
+    if (!userId) return;
+
+    const { id } = request.params;
+    if (!UUID_PATTERN.test(id)) {
+      request.log.warn({ requestedId: id }, "public profile rejected: malformed id");
+      return reply.code(400).send({ error: "id must be a valid uuid" });
+    }
+
+    const user = await userRepository.findById(id);
+    if (!user) {
+      request.log.warn({ requestedId: id }, "public profile fetch failed: user not found");
+      return reply.code(404).send({ error: "user not found" });
+    }
+    const stats = await statsRepository.findByUserId(id);
+    if (!stats) {
+      request.log.warn({ requestedId: id }, "public profile fetch failed: no stats row");
+      return reply.code(404).send({ error: "user not found" });
+    }
+
+    // deliberately minimal -- no email/phone/bio, this is a privacy boundary not an oversight
+    return reply.send({
+      id: user.id,
+      name: user.name,
+      photoUrl: user.photoUrl,
+      stats: {
+        minutesResolved: stats.minutesResolved,
+        avgRating: stats.avgRating,
+        ratingCount: stats.ratingCount,
+        minutesListener: stats.minutesListener,
+      },
+    });
+  });
+
+  app.post<{ Params: { id: string }; Body: IncrementMinutesResolvedBody }>(
+    "/internal/users/:id/stats/increment-minutes-resolved",
+    async (request, reply) => {
+      // service-to-service only -- deliberately not requireAuth/JWT, since no end user's
+      // token should ever be able to touch another user's stats
+      if (!requireInternalServiceToken(request, reply)) return;
+
+      const { id } = request.params;
+      if (!UUID_PATTERN.test(id)) {
+        request.log.warn({ requestedId: id }, "increment-minutes-resolved rejected: malformed id");
+        return reply.code(400).send({ error: "id must be a valid uuid" });
+      }
+
+      const { minutes } = request.body ?? ({} as IncrementMinutesResolvedBody);
+      if (
+        typeof minutes !== "number" ||
+        !Number.isInteger(minutes) ||
+        minutes <= 0 ||
+        minutes > MAX_MINUTES_RESOLVED_PER_CALL
+      ) {
+        request.log.warn({ requestedId: id, minutes }, "increment-minutes-resolved rejected: invalid minutes");
+        return reply.code(400).send({
+          error: `minutes must be a positive integer no greater than ${MAX_MINUTES_RESOLVED_PER_CALL}`,
+        });
+      }
+
+      const newTotal = await statsRepository.incrementMinutesResolved(id, minutes);
+      if (newTotal === null) {
+        request.log.warn({ requestedId: id }, "increment-minutes-resolved failed: user not found");
+        return reply.code(404).send({ error: "user not found" });
+      }
+
+      request.log.info({ requestedId: id, minutes }, "minutes_resolved incremented via internal call");
+      return reply.send({ minutesResolved: newTotal });
+    },
+  );
 
   return app;
 }
