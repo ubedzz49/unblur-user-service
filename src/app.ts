@@ -4,6 +4,11 @@ import { OtpService } from "./otp/service.js";
 import { signAuthToken, verifyAuthToken } from "./jwt.js";
 import { EmailSender, RecordingEmailSender } from "./email/sender.js";
 import { UserRepository, InMemoryUserRepository, ProfileUpdate } from "./users/repository.js";
+import {
+  ALLOWED_CONTENT_TYPES,
+  FakePhotoUploadUrlProvider,
+  PhotoUploadUrlProvider,
+} from "./photos/upload-url.js";
 
 interface SendOtpBody {
   identifier: string;
@@ -12,6 +17,10 @@ interface SendOtpBody {
 interface VerifyOtpBody {
   identifier: string;
   otp: string;
+}
+
+interface PhotoUploadUrlBody {
+  contentType: string;
 }
 
 const EMAIL_PATTERN = /^\S+@\S+\.\S+$/;
@@ -38,6 +47,7 @@ export function buildApp(
   otpStore: OtpStore = new InMemoryOtpStore(),
   emailSender: EmailSender = new RecordingEmailSender(),
   userRepository: UserRepository = new InMemoryUserRepository(),
+  photoUploadUrlProvider: PhotoUploadUrlProvider = new FakePhotoUploadUrlProvider(),
 ): FastifyInstance {
   // request/response logging is off during tests to keep test output readable --
   // level otherwise configurable via LOG_LEVEL (info by default)
@@ -130,6 +140,23 @@ export function buildApp(
       "profile updated",
     );
     return reply.send(updated);
+  });
+
+  app.post<{ Body: PhotoUploadUrlBody }>("/users/me/photo-upload-url", async (request, reply) => {
+    const userId = await requireAuth(request, reply);
+    if (!userId) return;
+
+    const { contentType } = request.body ?? {};
+    if (!contentType || !ALLOWED_CONTENT_TYPES.includes(contentType)) {
+      request.log.warn({ userId, contentType }, "photo upload url rejected: unsupported content type");
+      return reply.code(400).send({
+        error: `contentType must be one of: ${ALLOWED_CONTENT_TYPES.join(", ")}`,
+      });
+    }
+
+    const { uploadUrl, publicUrl } = await photoUploadUrlProvider.createUploadUrl(userId, contentType);
+    request.log.info({ userId }, "photo upload url issued");
+    return reply.send({ uploadUrl, publicUrl });
   });
 
   return app;
