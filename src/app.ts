@@ -101,11 +101,11 @@ export function buildApp(
     }
 
     const isEmail = EMAIL_PATTERN.test(identifier);
-    const user = await userRepository.findOrCreateByIdentifier(identifier, isEmail);
+    const { user, isNew } = await userRepository.findOrCreateByIdentifier(identifier, isEmail);
 
     const token = signAuthToken(user.id);
-    request.log.info({ userId: user.id }, "otp verified, user logged in");
-    return reply.send({ token });
+    request.log.info({ userId: user.id, isNew }, "otp verified, user logged in");
+    return reply.send({ token, isNewUser: isNew });
   });
 
   app.get("/users/me", async (request, reply) => {

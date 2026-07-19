@@ -16,8 +16,13 @@ export interface ProfileUpdate {
   aiNotesAndTranscriptsEnabled?: boolean;
 }
 
+export interface FindOrCreateResult {
+  user: User;
+  isNew: boolean;
+}
+
 export interface UserRepository {
-  findOrCreateByIdentifier(identifier: string, isEmail: boolean): Promise<User>;
+  findOrCreateByIdentifier(identifier: string, isEmail: boolean): Promise<FindOrCreateResult>;
   findById(id: string): Promise<User | null>;
   updateProfile(id: string, update: ProfileUpdate): Promise<User | null>;
 }
@@ -28,9 +33,9 @@ export class InMemoryUserRepository implements UserRepository {
   private idsByIdentifier = new Map<string, string>();
   private nextId = 1;
 
-  async findOrCreateByIdentifier(identifier: string, isEmail: boolean): Promise<User> {
+  async findOrCreateByIdentifier(identifier: string, isEmail: boolean): Promise<FindOrCreateResult> {
     const existingId = this.idsByIdentifier.get(identifier);
-    if (existingId) return this.usersById.get(existingId)!;
+    if (existingId) return { user: this.usersById.get(existingId)!, isNew: false };
 
     const id = `test-user-${this.nextId++}`;
     const user: User = {
@@ -45,7 +50,7 @@ export class InMemoryUserRepository implements UserRepository {
     };
     this.usersById.set(id, user);
     this.idsByIdentifier.set(identifier, id);
-    return user;
+    return { user, isNew: true };
   }
 
   async findById(id: string): Promise<User | null> {

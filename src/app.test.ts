@@ -126,6 +126,8 @@ describe("OTP verify links to a real user record", () => {
       payload: { identifier: "+911234567890", otp: send1.json().otp },
     });
     const token1 = verify1.json().token;
+    // first verify creates the account -> flagged new (frontend routes to onboarding)
+    expect(verify1.json().isNewUser).toBe(true);
 
     const send2 = await app.inject({ method: "POST", url: "/auth/otp/send", payload: { identifier: "+911234567890" } });
     const verify2 = await app.inject({
@@ -134,6 +136,8 @@ describe("OTP verify links to a real user record", () => {
       payload: { identifier: "+911234567890", otp: send2.json().otp },
     });
     const token2 = verify2.json().token;
+    // second verify is a returning login -> not new (frontend routes to home)
+    expect(verify2.json().isNewUser).toBe(false);
 
     const me1 = await app.inject({ method: "GET", url: "/users/me", headers: { authorization: `Bearer ${token1}` } });
     const me2 = await app.inject({ method: "GET", url: "/users/me", headers: { authorization: `Bearer ${token2}` } });
@@ -170,7 +174,7 @@ describe("PATCH /users/me", () => {
     const userRepo = new InMemoryUserRepository();
     const app = buildApp(new InMemoryOtpStore(), new RecordingEmailSender(), userRepo);
 
-    const user = await userRepo.findOrCreateByIdentifier("student@example.com", true);
+    const { user } = await userRepo.findOrCreateByIdentifier("student@example.com", true);
     const token = signAuthToken(user.id);
 
     const res = await app.inject({
@@ -201,7 +205,7 @@ describe("POST /users/me/photo-upload-url", () => {
   it("returns an upload url and a public url for an allowed content type", async () => {
     const userRepo = new InMemoryUserRepository();
     const app = buildApp(new InMemoryOtpStore(), new RecordingEmailSender(), userRepo);
-    const user = await userRepo.findOrCreateByIdentifier("student@example.com", true);
+    const { user } = await userRepo.findOrCreateByIdentifier("student@example.com", true);
     const token = signAuthToken(user.id);
 
     const res = await app.inject({
@@ -219,7 +223,7 @@ describe("POST /users/me/photo-upload-url", () => {
   it("rejects an unsupported content type", async () => {
     const userRepo = new InMemoryUserRepository();
     const app = buildApp(new InMemoryOtpStore(), new RecordingEmailSender(), userRepo);
-    const user = await userRepo.findOrCreateByIdentifier("student@example.com", true);
+    const { user } = await userRepo.findOrCreateByIdentifier("student@example.com", true);
     const token = signAuthToken(user.id);
 
     const res = await app.inject({
