@@ -20,13 +20,15 @@ async function requireAuth(request: FastifyRequest, reply: FastifyReply): Promis
   const header = request.headers.authorization;
   const token = header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : undefined;
   if (!token) {
+    request.log.warn("auth rejected: missing bearer token");
     reply.code(401).send({ error: "missing bearer token" });
     return undefined;
   }
 
   try {
     return verifyAuthToken(token).sub;
-  } catch {
+  } catch (err) {
+    request.log.warn({ err }, "auth rejected: invalid or expired token");
     reply.code(401).send({ error: "invalid or expired token" });
     return undefined;
   }
@@ -37,7 +39,11 @@ export function buildApp(
   emailSender: EmailSender = new RecordingEmailSender(),
   userRepository: UserRepository = new InMemoryUserRepository(),
 ): FastifyInstance {
-  const app = Fastify();
+  // request/response logging is off during tests to keep test output readable --
+  // level otherwise configurable via LOG_LEVEL (info by default)
+  const app = Fastify({
+    logger: process.env.NODE_ENV === "test" ? false : { level: process.env.LOG_LEVEL ?? "info" },
+  });
   const otpService = new OtpService(otpStore);
 
   app.get("/healthz", async () => ({ status: "ok" }));
@@ -45,11 +51,12 @@ export function buildApp(
   app.post<{ Body: SendOtpBody }>("/auth/otp/send", async (request, reply) => {
     const { identifier } = request.body ?? {};
     if (!identifier) {
+      request.log.warn("otp send rejected: missing identifier");
       return reply.code(400).send({ error: "identifier is required" });
     }
 
-    const { otp } = await otpService.send(identifier);
     const isEmail = EMAIL_PATTERN.test(identifier);
+    const { otp } = await otpService.send(identifier);
 
     if (isEmail) {
       await emailSender.send(
@@ -57,11 +64,13 @@ export function buildApp(
         "Your Unblur verification code",
         `Your verification code is ${otp}. It expires in 10 minutes.`,
       );
+      request.log.info({ identifierType: "email" }, "otp sent via email");
       return reply.send({ sent: true });
     }
 
     // phone identifiers have no SMS provider wired up yet (Twilio/MSG91 -- see 03_tech_stack.txt) --
     // return the code directly outside production so the flow stays testable until that lands
+    request.log.info({ identifierType: "phone" }, "otp generated, no sms provider -- returned in response");
     if (process.env.NODE_ENV === "production") {
       return reply.send({ sent: true });
     }
@@ -71,11 +80,13 @@ export function buildApp(
   app.post<{ Body: VerifyOtpBody }>("/auth/otp/verify", async (request, reply) => {
     const { identifier, otp } = request.body ?? {};
     if (!identifier || !otp) {
+      request.log.warn("otp verify rejected: missing identifier or otp");
       return reply.code(400).send({ error: "identifier and otp are required" });
     }
 
     const isValid = await otpService.verify(identifier, otp);
     if (!isValid) {
+      request.log.warn("otp verify failed: invalid or expired code");
       return reply.code(401).send({ error: "invalid or expired otp" });
     }
 
@@ -83,6 +94,7 @@ export function buildApp(
     const user = await userRepository.findOrCreateByIdentifier(identifier, isEmail);
 
     const token = signAuthToken(user.id);
+    request.log.info({ userId: user.id }, "otp verified, user logged in");
     return reply.send({ token });
   });
 
@@ -92,6 +104,7 @@ export function buildApp(
 
     const user = await userRepository.findById(userId);
     if (!user) {
+      request.log.warn({ userId }, "profile fetch failed: user not found");
       return reply.code(404).send({ error: "user not found" });
     }
     return reply.send(user);
@@ -109,8 +122,13 @@ export function buildApp(
       aiNotesAndTranscriptsEnabled,
     });
     if (!updated) {
+      request.log.warn({ userId }, "profile update failed: user not found");
       return reply.code(404).send({ error: "user not found" });
     }
+    request.log.info(
+      { userId, fieldsUpdated: Object.keys(request.body ?? {}) },
+      "profile updated",
+    );
     return reply.send(updated);
   });
 

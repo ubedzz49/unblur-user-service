@@ -87,3 +87,35 @@ All Unblur service repos are **public**. Treat that as the default, not an excep
   - The role itself gets least-privilege policies for what that pipeline actually does (e.g. ECR push + App Runner deploy) — never attach `AdministratorAccess` to a CI role.
 - **Runtime app secrets** (DB passwords, Razorpay/Stripe keys, JWT signing secret, video-provider API keys) never go in the repo, in a Dockerfile, or in a committed `.env` — only in the deploy environment's secret store (e.g. AWS Secrets Manager / SSM Parameter Store), injected at runtime. `.env.example` in the repo has placeholder names only.
 - Before adding any new CI/CD capability that needs cloud access, default to extending the existing OIDC role's permissions rather than minting a new static key — ask if unsure whether a permission add is broad enough to warrant a fresh look.
+
+## 7. Logging — every backend service, structured, leveled
+
+Every backend service (gateway, User Service, and every service added later) logs with a real
+structured logger and standard levels — not scattered `console.log`/`fmt.Println`/`log.Printf`
+calls with no level attached. This applies to backend/API services; the frontend is covered
+separately below.
+
+- **Levels, used for what they actually mean**, not just `info` for everything:
+  - `debug` — detail only useful while actively debugging (a resolved route, a cache hit/miss).
+    Off by default in production.
+  - `info` — a normal thing happened worth a record (server started, OTP sent, user created,
+    request routed). The default level in production.
+  - `warn` — something recoverable but worth a human's attention (a retried request, a
+    deprecated field still in use, a slow response).
+  - `error` — something failed and needs looking at (a DB query failed, an upstream call errored,
+    a panic was recovered). Always includes enough context to act on — which request, which user
+    (id, never PII like full email/phone in the log line itself), what failed and why.
+- **Structured, not string-concatenated** — a real logging library that emits fields (JSON in
+  production, human-readable in local dev), not `fmt.Sprintf` into a single message string. For
+  Go services: the standard library's `log/slog`. For Node services: Fastify's built-in `pino`
+  logger (just needs enabling — don't reach for a second logging library when the framework
+  already has one wired in).
+- **Never log secrets or full credentials** — no passwords, tokens, API keys, OTP codes, or full
+  card numbers in a log line, ever, matching the payment/security rules in section 2. Log an
+  identifier (user id, request id), not the sensitive value itself.
+- **Every request-handling path logs at least at `info` on success and `error` on failure** — a
+  handler that silently swallows an error (catches it just to return a generic 500) without
+  logging it is treated as a bug, same tier as missing test coverage.
+- **Frontend**: this structured-logging rule is a backend expectation. The frontend's own runtime
+  errors are handled via its normal error-boundary/toast patterns (see `FRONTEND_ARCHITECTURE.md`);
+  don't bolt a backend-style structured logger onto client-side code.
