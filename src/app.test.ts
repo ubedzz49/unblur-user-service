@@ -360,6 +360,40 @@ describe("expertise endpoints", () => {
     expect(listRes.json()).toHaveLength(0);
   });
 
+  // regression: real browsers/fetch clients (including our own frontend's request() helper)
+  // send Content-Type: application/json on every request regardless of whether there's a body --
+  // Fastify's default JSON parser rejects an empty body when that header is present, which broke
+  // every real DELETE call even though it worked fine via curl without the header
+  it("accepts an empty body with Content-Type: application/json set (real client behavior)", async () => {
+    const userRepo = new InMemoryUserRepository();
+    const expertiseRepo = new InMemoryExpertiseRepository();
+    const app = buildApp(
+      new InMemoryOtpStore(),
+      new RecordingEmailSender(),
+      userRepo,
+      undefined,
+      expertiseRepo,
+    );
+    const { user } = await userRepo.findOrCreateByIdentifier("student2@example.com", true);
+    const token = signAuthToken(user.id);
+
+    const addRes = await app.inject({
+      method: "POST",
+      url: "/users/me/expertise",
+      headers: { authorization: `Bearer ${token}` },
+      payload: { expertiseTypeId: "type-maths", expertiseLevelId: "level-class-12" },
+    });
+    const entryId = addRes.json().id;
+
+    const deleteRes = await app.inject({
+      method: "DELETE",
+      url: `/users/me/expertise/${entryId}`,
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      payload: "",
+    });
+    expect(deleteRes.statusCode).toBe(204);
+  });
+
   it("rejects with no token", async () => {
     const app = buildApp();
     const res = await app.inject({ method: "GET", url: "/users/me/expertise" });
