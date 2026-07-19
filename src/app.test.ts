@@ -4,6 +4,7 @@ import { InMemoryOtpStore } from "./otp/store.js";
 import { RecordingEmailSender } from "./email/sender.js";
 import { InMemoryUserRepository } from "./users/repository.js";
 import { InMemoryExpertiseRepository } from "./expertise/repository.js";
+import { FakeMatchingClient, MatchingClient } from "./matching/client.js";
 import { signAuthToken } from "./jwt.js";
 
 describe("GET /healthz", () => {
@@ -361,6 +362,129 @@ describe("expertise endpoints", () => {
   it("rejects with no token", async () => {
     const app = buildApp();
     const res = await app.inject({ method: "GET", url: "/users/me/expertise" });
+    expect(res.statusCode).toBe(401);
+  });
+});
+
+describe("POST /expertise-options/custom", () => {
+  beforeAll(() => {
+    process.env.JWT_SECRET = "test-secret";
+  });
+
+  function buildAuthedApp(matchingClient: MatchingClient = new FakeMatchingClient()) {
+    const userRepo = new InMemoryUserRepository();
+    const expertiseRepo = new InMemoryExpertiseRepository();
+    const app = buildApp(
+      new InMemoryOtpStore(),
+      new RecordingEmailSender(),
+      userRepo,
+      undefined,
+      expertiseRepo,
+      matchingClient,
+    );
+    return { app, userRepo };
+  }
+
+  async function authHeader(userRepo: InMemoryUserRepository) {
+    const { user } = await userRepo.findOrCreateByIdentifier("student@example.com", true);
+    return `Bearer ${signAuthToken(user.id)}`;
+  }
+
+  it("creates a brand-new custom subject and level", async () => {
+    const { app, userRepo } = buildAuthedApp();
+    const authorization = await authHeader(userRepo);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/expertise-options/custom",
+      headers: { authorization },
+      payload: { subjectName: "DSA", levelName: "Beginner" },
+    });
+
+    expect(res.statusCode).toBe(201);
+    const body = res.json();
+    expect(body.typeName).toBe("DSA");
+    expect(body.levelName).toBe("Beginner");
+    expect(body.expertiseTypeId).toBeTruthy();
+    expect(body.expertiseLevelId).toBeTruthy();
+  });
+
+  it("reuses an existing custom subject by slug on a second call", async () => {
+    const { app, userRepo } = buildAuthedApp();
+    const authorization = await authHeader(userRepo);
+
+    const first = await app.inject({
+      method: "POST",
+      url: "/expertise-options/custom",
+      headers: { authorization },
+      payload: { subjectName: "DSA", levelName: "Beginner" },
+    });
+    const second = await app.inject({
+      method: "POST",
+      url: "/expertise-options/custom",
+      headers: { authorization },
+      payload: { subjectName: "dsa", levelName: "beginner" },
+    });
+
+    expect(second.json().expertiseTypeId).toBe(first.json().expertiseTypeId);
+    expect(second.json().expertiseLevelId).toBe(first.json().expertiseLevelId);
+  });
+
+  it("creates and reuses 'General' when levelName is omitted", async () => {
+    const { app, userRepo } = buildAuthedApp();
+    const authorization = await authHeader(userRepo);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/expertise-options/custom",
+      headers: { authorization },
+      payload: { subjectName: "Underwater Basket Weaving" },
+    });
+
+    expect(res.statusCode).toBe(201);
+    expect(res.json().levelName).toBe("General");
+  });
+
+  it("rejects an empty subjectName with a 400", async () => {
+    const { app, userRepo } = buildAuthedApp();
+    const authorization = await authHeader(userRepo);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/expertise-options/custom",
+      headers: { authorization },
+      payload: { subjectName: "   " },
+    });
+
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("still returns 201 when the embed call fails", async () => {
+    class ThrowingMatchingClient implements MatchingClient {
+      async embedNode(): Promise<void> {
+        throw new Error("matching service unreachable");
+      }
+    }
+    const { app, userRepo } = buildAuthedApp(new ThrowingMatchingClient());
+    const authorization = await authHeader(userRepo);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/expertise-options/custom",
+      headers: { authorization },
+      payload: { subjectName: "DSA" },
+    });
+
+    expect(res.statusCode).toBe(201);
+  });
+
+  it("rejects with no token", async () => {
+    const { app } = buildAuthedApp();
+    const res = await app.inject({
+      method: "POST",
+      url: "/expertise-options/custom",
+      payload: { subjectName: "DSA" },
+    });
     expect(res.statusCode).toBe(401);
   });
 });

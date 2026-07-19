@@ -15,6 +15,7 @@ import {
   ExpertiseRepository,
   InMemoryExpertiseRepository,
 } from "./expertise/repository.js";
+import { HttpMatchingClient, MatchingClient } from "./matching/client.js";
 
 interface SendOtpBody {
   identifier: string;
@@ -32,6 +33,11 @@ interface PhotoUploadUrlBody {
 interface AddExpertiseBody {
   expertiseTypeId: string;
   expertiseLevelId: string;
+}
+
+interface CustomExpertiseBody {
+  subjectName: string;
+  levelName?: string;
 }
 
 const EMAIL_PATTERN = /^\S+@\S+\.\S+$/;
@@ -60,6 +66,7 @@ export function buildApp(
   userRepository: UserRepository = new InMemoryUserRepository(),
   photoUploadUrlProvider: PhotoUploadUrlProvider = new FakePhotoUploadUrlProvider(),
   expertiseRepository: ExpertiseRepository = new InMemoryExpertiseRepository(),
+  matchingClient: MatchingClient = new HttpMatchingClient(),
 ): FastifyInstance {
   // request/response logging is off during tests to keep test output readable --
   // level otherwise configurable via LOG_LEVEL (info by default)
@@ -173,6 +180,37 @@ export function buildApp(
 
   app.get("/expertise-options", async () => {
     return expertiseRepository.listOptions();
+  });
+
+  app.post<{ Body: CustomExpertiseBody }>("/expertise-options/custom", async (request, reply) => {
+    const userId = await requireAuth(request, reply);
+    if (!userId) return;
+
+    const { subjectName, levelName } = request.body ?? {};
+    if (!subjectName || typeof subjectName !== "string" || !subjectName.trim()) {
+      request.log.warn({ userId }, "custom expertise rejected: missing subjectName");
+      return reply.code(400).send({ error: "subjectName is required" });
+    }
+
+    const result = await expertiseRepository.findOrCreateCustom(subjectName, levelName);
+
+    const label = levelName ? `${subjectName.trim()} (${levelName.trim()})` : subjectName.trim();
+    // Embed immediately so the node is searchable via semantic matching right away rather than
+    // waiting for the next backfill. Graceful degradation: if this fails, the taxonomy node
+    // still gets created and returned successfully -- HttpMatchingClient already swallows its
+    // own errors, but we defensively catch here too so a misbehaving client can never fail
+    // this request.
+    try {
+      await matchingClient.embedNode(result.expertiseTypeId, result.expertiseLevelId, label);
+    } catch (err) {
+      request.log.warn({ userId, err }, "embed-node call failed, continuing without it");
+    }
+
+    request.log.info(
+      { userId, expertiseTypeId: result.expertiseTypeId, expertiseLevelId: result.expertiseLevelId },
+      "custom expertise created or reused",
+    );
+    return reply.code(201).send(result);
   });
 
   app.get("/users/me/expertise", async (request, reply) => {
