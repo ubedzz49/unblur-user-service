@@ -1,3 +1,4 @@
+import bcrypt from "bcrypt";
 import Fastify, { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { OtpStore, InMemoryOtpStore } from "./otp/store.js";
 import { OtpService } from "./otp/service.js";
@@ -25,6 +26,27 @@ interface VerifyOtpBody {
   identifier: string;
   otp: string;
 }
+
+interface PasswordLoginBody {
+  identifier: string;
+  password: string;
+}
+
+interface SetPasswordBody {
+  currentPassword?: string;
+  newPassword: string;
+}
+
+// bcrypt cost factor -- 12 is a reasonable default for interactive login in 2026 hardware terms,
+// comfortably above the "don't go below 10" floor without making login noticeably slow
+const BCRYPT_COST_FACTOR = 12;
+// widely-cited practical minimum for password length; short enough not to be user-hostile,
+// long enough to rule out the worst trivially-guessable passwords
+const MIN_PASSWORD_LENGTH = 8;
+// a bcrypt hash of a password nobody has: used to run bcrypt.compare's full cost even when the
+// looked-up user has no password_hash, so the "user not found" and "user has no password" cases
+// take about as long as the "wrong password" case and don't leak which case occurred via timing
+const DUMMY_HASH = "$2b$12$C6UzMDM.H6dfI/f/IKcEeOx0d2r8XX9XcQ2Jz1jP4YHzYyq7z7HcC";
 
 interface PhotoUploadUrlBody {
   contentType: string;
@@ -127,6 +149,34 @@ export function buildApp(
     return reply.send({ token, isNewUser: isNew });
   });
 
+  // NOTE: this endpoint is a brute-force target (attacker-controlled identifier + password,
+  // no lockout) -- it has no rate-limiting because this repo has no rate-limiting
+  // infrastructure to hook into yet. Flagging this rather than silently shipping it: this
+  // needs rate-limiting (e.g. per-identifier and per-IP) before password login becomes a
+  // primary auth path at any real scale.
+  app.post<{ Body: PasswordLoginBody }>("/auth/password/login", async (request, reply) => {
+    const { identifier, password } = request.body ?? {};
+    if (!identifier || !password) {
+      request.log.warn("password login rejected: missing identifier or password");
+      return reply.code(400).send({ error: "identifier and password are required" });
+    }
+
+    const record = await userRepository.findByIdentifierWithPassword(identifier);
+    // always run bcrypt.compare against *something*, even when there's no user or no password
+    // set, so response timing doesn't reveal which of the three failure cases occurred
+    const hashToCompare = record?.passwordHash ?? DUMMY_HASH;
+    const matches = await bcrypt.compare(password, hashToCompare);
+
+    if (!record || !record.passwordHash || !matches) {
+      request.log.warn("password login rejected: invalid credentials");
+      return reply.code(401).send({ error: "invalid credentials" });
+    }
+
+    const token = signAuthToken(record.id);
+    request.log.info({ userId: record.id }, "password login succeeded");
+    return reply.send({ token, mustResetPassword: record.mustResetPassword });
+  });
+
   app.get("/users/me", async (request, reply) => {
     const userId = await requireAuth(request, reply);
     if (!userId) return;
@@ -159,6 +209,41 @@ export function buildApp(
       "profile updated",
     );
     return reply.send(updated);
+  });
+
+  app.post<{ Body: SetPasswordBody }>("/users/me/password", async (request, reply) => {
+    const userId = await requireAuth(request, reply);
+    if (!userId) return;
+
+    const { currentPassword, newPassword } = request.body ?? {};
+    if (!newPassword || newPassword.length < MIN_PASSWORD_LENGTH) {
+      request.log.warn({ userId }, "set password rejected: newPassword too short");
+      return reply.code(400).send({ error: `newPassword must be at least ${MIN_PASSWORD_LENGTH} characters` });
+    }
+
+    const info = await userRepository.findPasswordInfoById(userId);
+    if (!info) {
+      request.log.warn({ userId }, "set password failed: user not found");
+      return reply.code(404).send({ error: "user not found" });
+    }
+
+    // a password is already set (including the shared default backfilled for pre-existing
+    // users) -- the caller must prove they know it before replacing it
+    if (info.passwordHash) {
+      const currentMatches = currentPassword
+        ? await bcrypt.compare(currentPassword, info.passwordHash)
+        : false;
+      if (!currentMatches) {
+        request.log.warn({ userId }, "set password rejected: current password incorrect");
+        return reply.code(401).send({ error: "current password is incorrect" });
+      }
+    }
+    // else: OTP-only user setting a password for the first time -- currentPassword not required
+
+    const newHash = await bcrypt.hash(newPassword, BCRYPT_COST_FACTOR);
+    await userRepository.setPassword(userId, newHash, false);
+    request.log.info({ userId }, "password set");
+    return reply.send({ ok: true });
   });
 
   app.post<{ Body: PhotoUploadUrlBody }>("/users/me/photo-upload-url", async (request, reply) => {

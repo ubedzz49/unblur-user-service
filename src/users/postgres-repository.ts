@@ -1,5 +1,5 @@
 import { Pool } from "pg";
-import { FindOrCreateResult, ProfileUpdate, User, UserRepository } from "./repository.js";
+import { FindOrCreateResult, ProfileUpdate, User, UserPasswordInfo, UserRepository } from "./repository.js";
 
 interface UserRow {
   id: string;
@@ -65,5 +65,34 @@ export class PostgresUserRepository implements UserRepository {
       [id, update.name ?? null, update.photoUrl ?? null, update.bio ?? null, update.aiNotesAndTranscriptsEnabled ?? null],
     );
     return result.rows.length > 0 ? toUser(result.rows[0]) : null;
+  }
+
+  async findByIdentifierWithPassword(identifier: string): Promise<UserPasswordInfo | null> {
+    const isEmail = identifier.includes("@");
+    const column = isEmail ? "email" : "phone";
+    const result = await this.pool.query<{ id: string; password_hash: string | null; must_reset_password: boolean }>(
+      `SELECT id, password_hash, must_reset_password FROM users WHERE ${column} = $1`,
+      [identifier],
+    );
+    if (result.rows.length === 0) return null;
+    const row = result.rows[0];
+    return { id: row.id, passwordHash: row.password_hash, mustResetPassword: row.must_reset_password };
+  }
+
+  async findPasswordInfoById(userId: string): Promise<UserPasswordInfo | null> {
+    const result = await this.pool.query<{ id: string; password_hash: string | null; must_reset_password: boolean }>(
+      "SELECT id, password_hash, must_reset_password FROM users WHERE id = $1",
+      [userId],
+    );
+    if (result.rows.length === 0) return null;
+    const row = result.rows[0];
+    return { id: row.id, passwordHash: row.password_hash, mustResetPassword: row.must_reset_password };
+  }
+
+  async setPassword(userId: string, passwordHash: string, mustResetPassword: boolean): Promise<void> {
+    await this.pool.query(
+      "UPDATE users SET password_hash = $2, must_reset_password = $3, updated_at = now() WHERE id = $1",
+      [userId, passwordHash, mustResetPassword],
+    );
   }
 }
