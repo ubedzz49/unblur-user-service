@@ -75,6 +75,30 @@ interface IncrementMinutesResolvedBody {
   minutes: number;
 }
 
+interface RecordRatingBody {
+  rating: number;
+}
+
+// 02_architecture.txt 2.7/2.8: seminar hosting needs 300+ mins resolved and 3.5+ avg rating;
+// GD organizing needs 100+ mins; GD attending needs 50+ mins. The doc doesn't spell out which
+// specific stat funds the two GD thresholds -- organizing is gated on minutesResolved (same
+// stat as seminar hosting, since organizing a GD is closer to a resolver-track activity) and
+// attending is gated on minutesListener (attending is a listener-side activity), which is the
+// natural reading of "organize" vs "attend" given the two stats this service tracks.
+const SEMINAR_HOST_MIN_MINUTES_RESOLVED = 300;
+const SEMINAR_HOST_MIN_AVG_RATING = 3.5;
+const GD_ORGANIZE_MIN_MINUTES_RESOLVED = 100;
+const GD_ATTEND_MIN_MINUTES_LISTENER = 50;
+
+function computeEligibility(stats: { minutesResolved: number; avgRating: number; minutesListener: number }) {
+  return {
+    canHostSeminar:
+      stats.minutesResolved >= SEMINAR_HOST_MIN_MINUTES_RESOLVED && stats.avgRating >= SEMINAR_HOST_MIN_AVG_RATING,
+    canOrganizeGD: stats.minutesResolved >= GD_ORGANIZE_MIN_MINUTES_RESOLVED,
+    canAttendGD: stats.minutesListener >= GD_ATTEND_MIN_MINUTES_LISTENER,
+  };
+}
+
 async function requireAuth(request: FastifyRequest, reply: FastifyReply): Promise<string | undefined> {
   const header = request.headers.authorization;
   const token = header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : undefined;
@@ -393,6 +417,7 @@ export function buildApp(
       ratingCount: stats.ratingCount,
       minutesListener: stats.minutesListener,
       updatedAt: stats.updatedAt,
+      eligibility: computeEligibility(stats),
     });
   });
 
@@ -435,6 +460,7 @@ export function buildApp(
         avgRating: stats.avgRating,
         ratingCount: stats.ratingCount,
         minutesListener: stats.minutesListener,
+        eligibility: computeEligibility(stats),
       },
     });
   });
@@ -473,6 +499,35 @@ export function buildApp(
 
       request.log.info({ requestedId: id, minutes }, "minutes_resolved incremented via internal call");
       return reply.send({ minutesResolved: newTotal });
+    },
+  );
+
+  app.post<{ Params: { id: string }; Body: RecordRatingBody }>(
+    "/internal/users/:id/stats/record-rating",
+    async (request, reply) => {
+      // service-to-service only -- same reasoning as increment-minutes-resolved above
+      if (!requireInternalServiceToken(request, reply)) return;
+
+      const { id } = request.params;
+      if (!UUID_PATTERN.test(id)) {
+        request.log.warn({ requestedId: id }, "record-rating rejected: malformed id");
+        return reply.code(400).send({ error: "id must be a valid uuid" });
+      }
+
+      const { rating } = request.body ?? ({} as RecordRatingBody);
+      if (typeof rating !== "number" || !Number.isInteger(rating) || rating < 1 || rating > 5) {
+        request.log.warn({ requestedId: id, rating }, "record-rating rejected: invalid rating");
+        return reply.code(400).send({ error: "rating must be an integer between 1 and 5" });
+      }
+
+      const result = await statsRepository.recordRating(id, rating);
+      if (result === null) {
+        request.log.warn({ requestedId: id }, "record-rating failed: user not found");
+        return reply.code(404).send({ error: "user not found" });
+      }
+
+      request.log.info({ requestedId: id, rating }, "rating recorded via internal call");
+      return reply.send({ avgRating: result.avgRating, ratingCount: result.ratingCount });
     },
   );
 

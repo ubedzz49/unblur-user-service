@@ -37,4 +37,25 @@ describe("InMemoryStatsRepository", () => {
     const repo = new InMemoryStatsRepository();
     expect(await repo.incrementMinutesResolved("nonexistent", 10)).toBeNull();
   });
+
+  it("recordRating computes a running average across multiple ratings", async () => {
+    const repo = new InMemoryStatsRepository();
+    await repo.initializeForUser("user-1");
+
+    const first = await repo.recordRating("user-1", 5);
+    expect(first).toEqual({ avgRating: 5, ratingCount: 1 });
+
+    // (5 + 3) / 2 = 4, exactly
+    const second = await repo.recordRating("user-1", 3);
+    expect(second).toEqual({ avgRating: 4, ratingCount: 2 });
+
+    // (5 + 3 + 4) / 3 = 4, exactly
+    const third = await repo.recordRating("user-1", 4);
+    expect(third).toEqual({ avgRating: 4, ratingCount: 3 });
+  });
+
+  it("recordRating returns null for a nonexistent user", async () => {
+    const repo = new InMemoryStatsRepository();
+    expect(await repo.recordRating("nonexistent", 5)).toBeNull();
+  });
 });

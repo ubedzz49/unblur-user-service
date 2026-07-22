@@ -45,4 +45,20 @@ export class PostgresStatsRepository implements StatsRepository {
     );
     return result.rows.length > 0 ? result.rows[0].minutes_resolved : null;
   }
+
+  async recordRating(userId: string, rating: number): Promise<{ avgRating: number; ratingCount: number } | null> {
+    // running average computed entirely inside the UPDATE so concurrent raters can't clobber
+    // each other the way a read-then-write in application code would
+    const result = await this.pool.query<{ avg_rating: string; rating_count: number }>(
+      `UPDATE user_stats
+         SET avg_rating = (avg_rating * rating_count + $2) / (rating_count + 1),
+             rating_count = rating_count + 1,
+             updated_at = now()
+       WHERE user_id = $1
+       RETURNING avg_rating, rating_count`,
+      [userId, rating],
+    );
+    if (result.rows.length === 0) return null;
+    return { avgRating: Number(result.rows[0].avg_rating), ratingCount: result.rows[0].rating_count };
+  }
 }

@@ -563,6 +563,7 @@ describe("GET /users/me/stats", () => {
       ratingCount: 0,
       minutesListener: 0,
       updatedAt: expect.any(String),
+      eligibility: { canHostSeminar: false, canOrganizeGD: false, canAttendGD: false },
     });
   });
 
@@ -585,6 +586,95 @@ describe("GET /users/me/stats", () => {
     const { app } = build();
     const res = await app.inject({ method: "GET", url: "/users/me/stats" });
     expect(res.statusCode).toBe(401);
+  });
+
+  it("canHostSeminar is true right at the 300 minutes / 3.5 rating threshold (inclusive)", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("student@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+    await statsRepo.incrementMinutesResolved(user.id, 300);
+    // land avgRating exactly on 3.5: (3+4)/2 = 3.5
+    await statsRepo.recordRating(user.id, 3);
+    await statsRepo.recordRating(user.id, 4);
+    const token = signAuthToken(user.id);
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/users/me/stats",
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.json().eligibility.canHostSeminar).toBe(true);
+  });
+
+  it("canHostSeminar is false one minute below the 300 threshold", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("student@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+    await statsRepo.incrementMinutesResolved(user.id, 299);
+    await statsRepo.recordRating(user.id, 5);
+    const token = signAuthToken(user.id);
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/users/me/stats",
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.json().eligibility.canHostSeminar).toBe(false);
+  });
+
+  it("canOrganizeGD is true at exactly 100 minutes resolved and false at 99", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user: atThreshold } = await userRepo.findOrCreateByIdentifier("at-threshold@example.com", true);
+    await statsRepo.initializeForUser(atThreshold.id);
+    await statsRepo.incrementMinutesResolved(atThreshold.id, 100);
+
+    const { user: belowThreshold } = await userRepo.findOrCreateByIdentifier("below-threshold@example.com", true);
+    await statsRepo.initializeForUser(belowThreshold.id);
+    await statsRepo.incrementMinutesResolved(belowThreshold.id, 99);
+
+    const atRes = await app.inject({
+      method: "GET",
+      url: "/users/me/stats",
+      headers: { authorization: `Bearer ${signAuthToken(atThreshold.id)}` },
+    });
+    const belowRes = await app.inject({
+      method: "GET",
+      url: "/users/me/stats",
+      headers: { authorization: `Bearer ${signAuthToken(belowThreshold.id)}` },
+    });
+
+    expect(atRes.json().eligibility.canOrganizeGD).toBe(true);
+    expect(belowRes.json().eligibility.canOrganizeGD).toBe(false);
+  });
+
+  it("canAttendGD is true at exactly 50 minutesListener and false at 49", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user: atThreshold } = await userRepo.findOrCreateByIdentifier("at-listener-threshold@example.com", true);
+    await statsRepo.initializeForUser(atThreshold.id);
+    statsRepo.seedMinutesListener(atThreshold.id, 50);
+
+    const { user: belowThreshold } = await userRepo.findOrCreateByIdentifier(
+      "below-listener-threshold@example.com",
+      true,
+    );
+    await statsRepo.initializeForUser(belowThreshold.id);
+    statsRepo.seedMinutesListener(belowThreshold.id, 49);
+
+    const atRes = await app.inject({
+      method: "GET",
+      url: "/users/me/stats",
+      headers: { authorization: `Bearer ${signAuthToken(atThreshold.id)}` },
+    });
+    const belowRes = await app.inject({
+      method: "GET",
+      url: "/users/me/stats",
+      headers: { authorization: `Bearer ${signAuthToken(belowThreshold.id)}` },
+    });
+
+    expect(atRes.json().eligibility.canAttendGD).toBe(true);
+    expect(belowRes.json().eligibility.canAttendGD).toBe(false);
   });
 });
 
@@ -634,7 +724,13 @@ describe("GET /users/:id/public", () => {
       photoUrl: "https://cdn/asha.png",
       bio: "I help with CAT quant",
       expertise: [],
-      stats: { minutesResolved: 0, avgRating: 0, ratingCount: 0, minutesListener: 0 },
+      stats: {
+        minutesResolved: 0,
+        avgRating: 0,
+        ratingCount: 0,
+        minutesListener: 0,
+        eligibility: { canHostSeminar: false, canOrganizeGD: false, canAttendGD: false },
+      },
     });
     // privacy boundary -- these must never appear in the public view
     expect(Object.keys(body)).not.toContain("email");
@@ -932,5 +1028,242 @@ describe("POST /internal/users/:id/stats/increment-minutes-resolved", () => {
     });
 
     expect(res.statusCode).toBe(400);
+  });
+});
+
+describe("POST /internal/users/:id/stats/record-rating", () => {
+  const originalInternalToken = process.env.INTERNAL_SERVICE_TOKEN;
+
+  beforeAll(() => {
+    process.env.JWT_SECRET = "test-secret";
+    process.env.INTERNAL_SERVICE_TOKEN = "test-internal-secret";
+  });
+
+  afterAll(() => {
+    process.env.INTERNAL_SERVICE_TOKEN = originalInternalToken;
+  });
+
+  function build() {
+    const userRepo = new InMemoryUserRepository();
+    const statsRepo = new InMemoryStatsRepository();
+    const app = buildApp(
+      new InMemoryOtpStore(),
+      new RecordingEmailSender(),
+      userRepo,
+      undefined,
+      new InMemoryExpertiseRepository(),
+      new FakeMatchingClient(),
+      statsRepo,
+    );
+    return { app, userRepo, statsRepo };
+  }
+
+  it("succeeds with the correct internal token and computes the running average", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("resolver@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+
+    const first = await app.inject({
+      method: "POST",
+      url: `/internal/users/${user.id}/stats/record-rating`,
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { rating: 5 },
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toEqual({ avgRating: 5, ratingCount: 1 });
+
+    // 5 then 3 -- average must land on exactly 4, not some rounding artifact
+    const second = await app.inject({
+      method: "POST",
+      url: `/internal/users/${user.id}/stats/record-rating`,
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { rating: 3 },
+    });
+    expect(second.statusCode).toBe(200);
+    expect(second.json()).toEqual({ avgRating: 4, ratingCount: 2 });
+  });
+
+  it("rejects a request with no internal token header", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("resolver@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/internal/users/${user.id}/stats/record-rating`,
+      payload: { rating: 4 },
+    });
+
+    expect(res.statusCode).toBe(401);
+    expect(res.json()).toEqual({ error: "invalid internal service token" });
+  });
+
+  it("rejects a request with the wrong internal token value", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("resolver@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/internal/users/${user.id}/stats/record-rating`,
+      headers: { "x-internal-service-token": "totally-wrong" },
+      payload: { rating: 4 },
+    });
+
+    expect(res.statusCode).toBe(401);
+  });
+
+  // the core security property: a real, validly-signed end-user jwt must not work here --
+  // this endpoint is service-to-service only, no user has a legitimate reason to call it
+  it("rejects a request using a valid user JWT instead of the internal token", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("resolver@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+    const userToken = signAuthToken(user.id);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/internal/users/${user.id}/stats/record-rating`,
+      headers: { authorization: `Bearer ${userToken}` },
+      payload: { rating: 4 },
+    });
+
+    expect(res.statusCode).toBe(401);
+    const stats = await statsRepo.findByUserId(user.id);
+    expect(stats?.ratingCount).toBe(0);
+  });
+
+  it("rejects a rating of 0", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("resolver@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/internal/users/${user.id}/stats/record-rating`,
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { rating: 0 },
+    });
+
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects a negative rating", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("resolver@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/internal/users/${user.id}/stats/record-rating`,
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { rating: -1 },
+    });
+
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects a rating above 5", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("resolver@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/internal/users/${user.id}/stats/record-rating`,
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { rating: 6 },
+    });
+
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects a non-integer rating", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("resolver@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/internal/users/${user.id}/stats/record-rating`,
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { rating: 3.5 },
+    });
+
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects a non-numeric rating", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("resolver@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/internal/users/${user.id}/stats/record-rating`,
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { rating: "five" },
+    });
+
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("returns 404 for a nonexistent target user id even with a valid internal token", async () => {
+    const { app } = build();
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/internal/users/00000000-0000-4000-8000-000000000000/stats/record-rating",
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { rating: 4 },
+    });
+
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("returns 400 for a malformed target user id", async () => {
+    const { app } = build();
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/internal/users/not-a-uuid/stats/record-rating",
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { rating: 4 },
+    });
+
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("two concurrent rating submissions both land -- proves it's atomic, not read-then-write", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("resolver@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+
+    // fire both without awaiting one before the other -- a read-then-write implementation
+    // could have one submission read the pre-update state and clobber the other's write
+    const [a, b] = await Promise.all([
+      app.inject({
+        method: "POST",
+        url: `/internal/users/${user.id}/stats/record-rating`,
+        headers: { "x-internal-service-token": "test-internal-secret" },
+        payload: { rating: 5 },
+      }),
+      app.inject({
+        method: "POST",
+        url: `/internal/users/${user.id}/stats/record-rating`,
+        headers: { "x-internal-service-token": "test-internal-secret" },
+        payload: { rating: 3 },
+      }),
+    ]);
+
+    expect(a.statusCode).toBe(200);
+    expect(b.statusCode).toBe(200);
+
+    const stats = await statsRepo.findByUserId(user.id);
+    // both submissions must have landed -- ratingCount reflects both, and the average is
+    // mathematically correct for 5 and 3 having both been recorded (average of 4), regardless
+    // of which one the event loop happened to apply first
+    expect(stats?.ratingCount).toBe(2);
+    expect(stats?.avgRating).toBe(4);
   });
 });

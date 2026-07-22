@@ -14,6 +14,9 @@ export interface StatsRepository {
   findByUserId(userId: string): Promise<UserStats | null>;
   // atomic add, not read-then-write -- returns the new total, null if user doesn't exist
   incrementMinutesResolved(userId: string, minutes: number): Promise<number | null>;
+  // atomic running-average update, not read-then-write -- returns the new avgRating/ratingCount,
+  // null if user doesn't exist
+  recordRating(userId: string, rating: number): Promise<{ avgRating: number; ratingCount: number } | null>;
 }
 
 // test-only -- avoids CI needing a real Postgres instance
@@ -42,5 +45,24 @@ export class InMemoryStatsRepository implements StatsRepository {
     const updated = { ...existing, minutesResolved: existing.minutesResolved + minutes, updatedAt: new Date().toISOString() };
     this.statsByUserId.set(userId, updated);
     return updated.minutesResolved;
+  }
+
+  async recordRating(userId: string, rating: number): Promise<{ avgRating: number; ratingCount: number } | null> {
+    const existing = this.statsByUserId.get(userId);
+    if (!existing) return null;
+    // running average -- new_avg = (old_avg * old_count + rating) / (old_count + 1)
+    const newCount = existing.ratingCount + 1;
+    const newAvg = (existing.avgRating * existing.ratingCount + rating) / newCount;
+    const updated = { ...existing, avgRating: newAvg, ratingCount: newCount, updatedAt: new Date().toISOString() };
+    this.statsByUserId.set(userId, updated);
+    return { avgRating: updated.avgRating, ratingCount: updated.ratingCount };
+  }
+
+  // test helper -- no production write path sets minutesListener yet (that lands with whatever
+  // service tracks GD/listening attendance), but eligibility tests still need to seed it
+  seedMinutesListener(userId: string, minutes: number): void {
+    const existing = this.statsByUserId.get(userId);
+    if (!existing) return;
+    this.statsByUserId.set(userId, { ...existing, minutesListener: minutes });
   }
 }
