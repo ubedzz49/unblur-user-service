@@ -62,4 +62,35 @@ describe.runIf(shouldRun)("PostgresStatsRepository (real postgres)", () => {
     const result = await statsRepo.incrementMinutesResolved("00000000-0000-4000-8000-000000000000", 10);
     expect(result).toBeNull();
   });
+
+  it("recordRating computes the running average entirely in the UPDATE", async () => {
+    const { user } = await userRepo.findOrCreateByIdentifier(`integration-rating-${Date.now()}@example.com`, true);
+
+    const first = await statsRepo.recordRating(user.id, 5);
+    expect(first).toEqual({ avgRating: 5, ratingCount: 1 });
+
+    const second = await statsRepo.recordRating(user.id, 3);
+    expect(second).toEqual({ avgRating: 4, ratingCount: 2 });
+  });
+
+  it("two concurrent recordRating calls both land -- proves it's atomic, not read-then-write", async () => {
+    const { user } = await userRepo.findOrCreateByIdentifier(
+      `integration-rating-concurrent-${Date.now()}@example.com`,
+      true,
+    );
+
+    const [a, b] = await Promise.all([statsRepo.recordRating(user.id, 5), statsRepo.recordRating(user.id, 3)]);
+
+    expect(a).not.toBeNull();
+    expect(b).not.toBeNull();
+
+    const finalStats = await statsRepo.findByUserId(user.id);
+    expect(finalStats?.ratingCount).toBe(2);
+    expect(finalStats?.avgRating).toBe(4);
+  });
+
+  it("returns null recording a rating for a nonexistent user", async () => {
+    const result = await statsRepo.recordRating("00000000-0000-4000-8000-000000000000", 5);
+    expect(result).toBeNull();
+  });
 });
