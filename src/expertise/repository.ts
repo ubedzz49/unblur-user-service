@@ -51,8 +51,12 @@ export interface ExpertiseRepository {
   removeForUser(userId: string, userExpertiseId: string): Promise<boolean>;
   // find-or-create a "user-submitted" taxonomy node for a subject the curated taxonomy doesn't
   // have. Two different users typing the same subject (case-insensitively, once slugified)
-  // reuse the same node rather than creating duplicates.
+  // reuse the same node rather than creating duplicates. Also reused by the admin dashboard's
+  // manual/bulk-import topic creation -- same dedup semantics apply either way.
   findOrCreateCustom(subjectName: string, levelName?: string): Promise<CustomExpertiseResult>;
+  // admin-only: permanently removes a taxonomy level (cascades to any user_expertise rows
+  // referencing it). Returns false if the level didn't exist.
+  removeExpertiseLevel(expertiseLevelId: string): Promise<boolean>;
 }
 
 // test-only -- avoids CI needing a real Postgres instance
@@ -151,5 +155,18 @@ export class InMemoryExpertiseRepository implements ExpertiseRepository {
       typeName: type.name,
       levelName: level.name,
     };
+  }
+
+  async removeExpertiseLevel(expertiseLevelId: string): Promise<boolean> {
+    let removed = false;
+    // mirrors Postgres exactly: deleting a level never cascades back up to its parent type,
+    // even if it was the type's only level -- an empty type row is left behind either way
+    this.options = this.options.map((type) => {
+      const before = type.levels.length;
+      const levels = type.levels.filter((l) => l.id !== expertiseLevelId);
+      if (levels.length !== before) removed = true;
+      return { ...type, levels };
+    });
+    return removed;
   }
 }

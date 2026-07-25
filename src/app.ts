@@ -64,6 +64,22 @@ interface CustomExpertiseBody {
   levelName?: string;
 }
 
+interface BlockUserBody {
+  email?: string;
+}
+
+interface AdminExpertiseImportBody {
+  nodes?: { subjectName?: string; levelName?: string }[];
+}
+
+interface ListUsersQuery {
+  limit?: string;
+  offset?: string;
+}
+
+const DEFAULT_ADMIN_LIST_LIMIT = 50;
+const MAX_ADMIN_LIST_LIMIT = 200;
+
 const EMAIL_PATTERN = /^\S+@\S+\.\S+$/;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -114,6 +130,31 @@ async function requireAuth(request: FastifyRequest, reply: FastifyReply): Promis
     request.log.warn({ err }, "auth rejected: invalid or expired token");
     reply.code(401).send({ error: "invalid or expired token" });
     return undefined;
+  }
+}
+
+// this service verifies the JWT itself (it's the one that signs them), so the admin check reads
+// the role claim directly off the token rather than trusting a gateway-forwarded header the way
+// every other service's admin routes do
+async function requireAdminAuth(request: FastifyRequest, reply: FastifyReply): Promise<boolean> {
+  const header = request.headers.authorization;
+  const token = header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : undefined;
+  if (!token) {
+    reply.code(401).send({ error: "missing bearer token" });
+    return false;
+  }
+
+  try {
+    const payload = verifyAuthToken(token);
+    if (payload.role !== "admin") {
+      reply.code(403).send({ error: "admin access required" });
+      return false;
+    }
+    return true;
+  } catch (err) {
+    request.log.warn({ err }, "admin auth rejected: invalid or expired token");
+    reply.code(401).send({ error: "invalid or expired token" });
+    return false;
   }
 }
 
@@ -195,6 +236,12 @@ export function buildApp(
 
     const isEmail = EMAIL_PATTERN.test(identifier);
     const { user, isNew } = await userRepository.findOrCreateByIdentifier(identifier, isEmail);
+
+    if (user.blockedAt) {
+      request.log.warn({ userId: user.id }, "otp verify rejected: account is blocked");
+      return reply.code(403).send({ error: "this account has been blocked" });
+    }
+
     // in-memory repo path (real Postgres path already does this in the same db transaction
     // as the user insert, see PostgresUserRepository.findOrCreateByIdentifier) -- idempotent
     // either way, so calling it unconditionally is harmless
@@ -217,6 +264,25 @@ export function buildApp(
       return reply.code(400).send({ error: "identifier and password are required" });
     }
 
+    // the fixed admin login -- a distinct credential pair (username + bcrypt hash, both from
+    // Secrets Manager, never in code), checked before any real-user lookup. No real user can
+    // ever collide with this: ADMIN_USERNAME isn't email/phone-shaped, so it can never match a
+    // real identifier. Falls through to the dummy-hash compare below (not a separate early
+    // return before that) so a wrong admin password takes the same code path/timing as any
+    // other wrong-password attempt.
+    const adminUsername = process.env.ADMIN_USERNAME;
+    const adminPasswordHash = process.env.ADMIN_PASSWORD_HASH;
+    if (adminUsername && adminPasswordHash && identifier === adminUsername) {
+      const adminMatches = await bcrypt.compare(password, adminPasswordHash);
+      if (!adminMatches) {
+        request.log.warn("admin password login rejected: invalid credentials");
+        return reply.code(401).send({ error: "invalid credentials" });
+      }
+      const token = signAuthToken("admin", "admin");
+      request.log.info("admin password login succeeded");
+      return reply.send({ token, mustResetPassword: false, isAdmin: true });
+    }
+
     const record = await userRepository.findByIdentifierWithPassword(identifier);
     // always run bcrypt.compare against *something*, even when there's no user or no password
     // set, so response timing doesn't reveal which of the three failure cases occurred
@@ -228,9 +294,14 @@ export function buildApp(
       return reply.code(401).send({ error: "invalid credentials" });
     }
 
+    if (record.blockedAt) {
+      request.log.warn({ userId: record.id }, "password login rejected: account is blocked");
+      return reply.code(403).send({ error: "this account has been blocked" });
+    }
+
     const token = signAuthToken(record.id);
     request.log.info({ userId: record.id }, "password login succeeded");
-    return reply.send({ token, mustResetPassword: record.mustResetPassword });
+    return reply.send({ token, mustResetPassword: record.mustResetPassword, isAdmin: false });
   });
 
   app.get("/users/me", async (request, reply) => {
@@ -530,6 +601,112 @@ export function buildApp(
       return reply.send({ avgRating: result.avgRating, ratingCount: result.ratingCount });
     },
   );
+
+  app.get<{ Querystring: ListUsersQuery }>("/admin/users", async (request, reply) => {
+    if (!(await requireAdminAuth(request, reply))) return;
+
+    const limit = Math.min(Number(request.query.limit ?? DEFAULT_ADMIN_LIST_LIMIT) || DEFAULT_ADMIN_LIST_LIMIT, MAX_ADMIN_LIST_LIMIT);
+    const offset = Math.max(Number(request.query.offset ?? 0) || 0, 0);
+    const users = await userRepository.listUsers(limit, offset);
+    return reply.send(users);
+  });
+
+  app.post<{ Body: BlockUserBody }>("/admin/users/block", async (request, reply) => {
+    if (!(await requireAdminAuth(request, reply))) return;
+
+    const { email } = request.body ?? {};
+    if (!email || typeof email !== "string") {
+      return reply.code(400).send({ error: "email is required" });
+    }
+
+    const user = await userRepository.blockByEmail(email);
+    if (!user) {
+      return reply.code(404).send({ error: "no user found with that email" });
+    }
+    request.log.info({ userId: user.id }, "user blocked by admin");
+    return reply.send(user);
+  });
+
+  app.post<{ Body: BlockUserBody }>("/admin/users/unblock", async (request, reply) => {
+    if (!(await requireAdminAuth(request, reply))) return;
+
+    const { email } = request.body ?? {};
+    if (!email || typeof email !== "string") {
+      return reply.code(400).send({ error: "email is required" });
+    }
+
+    const user = await userRepository.unblockByEmail(email);
+    if (!user) {
+      return reply.code(404).send({ error: "no user found with that email" });
+    }
+    request.log.info({ userId: user.id }, "user unblocked by admin");
+    return reply.send(user);
+  });
+
+  // shared by both admin expertise routes below -- same find-or-create + best-effort embed
+  // pattern as the user-facing /expertise-options/custom endpoint above
+  async function createExpertiseNode(subjectName: string, levelName: string | undefined, log: FastifyRequest["log"]) {
+    const result = await expertiseRepository.findOrCreateCustom(subjectName, levelName);
+    const label = levelName ? `${subjectName.trim()} (${levelName.trim()})` : subjectName.trim();
+    try {
+      await matchingClient.embedNode(result.expertiseTypeId, result.expertiseLevelId, label);
+    } catch (err) {
+      log.warn({ err }, "admin expertise: embed-node call failed, continuing without it");
+    }
+    return result;
+  }
+
+  app.post<{ Body: CustomExpertiseBody }>("/admin/expertise", async (request, reply) => {
+    if (!(await requireAdminAuth(request, reply))) return;
+
+    const { subjectName, levelName } = request.body ?? {};
+    if (!subjectName || typeof subjectName !== "string" || !subjectName.trim()) {
+      return reply.code(400).send({ error: "subjectName is required" });
+    }
+
+    const result = await createExpertiseNode(subjectName, levelName, request.log);
+    request.log.info({ expertiseTypeId: result.expertiseTypeId }, "expertise topic added by admin");
+    return reply.code(201).send(result);
+  });
+
+  app.post<{ Body: AdminExpertiseImportBody }>("/admin/expertise/import", async (request, reply) => {
+    if (!(await requireAdminAuth(request, reply))) return;
+
+    const { nodes } = request.body ?? {};
+    if (!Array.isArray(nodes) || nodes.length === 0) {
+      return reply.code(400).send({ error: "nodes must be a non-empty array" });
+    }
+
+    const created: unknown[] = [];
+    const failed: { subjectName?: string; error: string }[] = [];
+    for (const node of nodes) {
+      if (!node.subjectName || typeof node.subjectName !== "string" || !node.subjectName.trim()) {
+        failed.push({ subjectName: node.subjectName, error: "subjectName is required" });
+        continue;
+      }
+      try {
+        const result = await createExpertiseNode(node.subjectName, node.levelName, request.log);
+        created.push(result);
+      } catch (err) {
+        request.log.warn({ err, subjectName: node.subjectName }, "admin bulk expertise import: one node failed");
+        failed.push({ subjectName: node.subjectName, error: "failed to create" });
+      }
+    }
+
+    request.log.info({ createdCount: created.length, failedCount: failed.length }, "admin bulk expertise import complete");
+    return reply.code(201).send({ created, failed });
+  });
+
+  app.delete<{ Params: { levelId: string } }>("/admin/expertise/:levelId", async (request, reply) => {
+    if (!(await requireAdminAuth(request, reply))) return;
+
+    const removed = await expertiseRepository.removeExpertiseLevel(request.params.levelId);
+    if (!removed) {
+      return reply.code(404).send({ error: "expertise level not found" });
+    }
+    request.log.info({ levelId: request.params.levelId }, "expertise topic removed by admin");
+    return reply.send({ ok: true });
+  });
 
   return app;
 }
