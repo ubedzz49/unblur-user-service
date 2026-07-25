@@ -183,4 +183,9 @@ export class PostgresExpertiseRepository implements ExpertiseRepository {
       client.release();
     }
   }
+
+  async removeExpertiseLevel(expertiseLevelId: string): Promise<boolean> {
+    const result = await this.pool.query("DELETE FROM expertise_levels WHERE id = $1", [expertiseLevelId]);
+    return (result.rowCount ?? 0) > 0;
+  }
 }

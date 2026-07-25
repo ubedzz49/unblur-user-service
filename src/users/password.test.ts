@@ -202,3 +202,154 @@ describe("password backfill semantics (repository-level)", () => {
     return user;
   }
 });
+
+describe("admin login via /auth/password/login", () => {
+  const originalJwtSecret = process.env.JWT_SECRET;
+  const originalAdminUsername = process.env.ADMIN_USERNAME;
+  const originalAdminPasswordHash = process.env.ADMIN_PASSWORD_HASH;
+
+  beforeAll(async () => {
+    process.env.JWT_SECRET = "test-secret";
+    process.env.ADMIN_USERNAME = "admin";
+    process.env.ADMIN_PASSWORD_HASH = await bcrypt.hash("correct-admin-pass", BCRYPT_COST_FACTOR);
+  });
+
+  afterAll(() => {
+    process.env.JWT_SECRET = originalJwtSecret;
+    process.env.ADMIN_USERNAME = originalAdminUsername;
+    process.env.ADMIN_PASSWORD_HASH = originalAdminPasswordHash;
+  });
+
+  it("logs in as admin with the correct credentials, returning isAdmin and a role: admin token", async () => {
+    const app = buildApp();
+    const res = await app.inject({
+      method: "POST",
+      url: "/auth/password/login",
+      payload: { identifier: "admin", password: "correct-admin-pass" },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.isAdmin).toBe(true);
+    expect(body.mustResetPassword).toBe(false);
+    expect(verifyAuthToken(body.token)).toMatchObject({ sub: "admin", role: "admin" });
+  });
+
+  it("rejects the admin username with the wrong password", async () => {
+    const app = buildApp();
+    const res = await app.inject({
+      method: "POST",
+      url: "/auth/password/login",
+      payload: { identifier: "admin", password: "wrong-pass" },
+    });
+
+    expect(res.statusCode).toBe(401);
+    expect(res.json()).toEqual({ error: "invalid credentials" });
+  });
+
+  it("never lets a real user share the admin identifier's token shape", async () => {
+    const userRepo = new InMemoryUserRepository();
+    const user = await createUserFor(userRepo, "student@example.com");
+    const hash = await bcrypt.hash("correct-horse-battery", BCRYPT_COST_FACTOR);
+    userRepo.seedPassword(user.id, hash, false);
+
+    const app = buildApp(undefined, undefined, userRepo);
+    const res = await app.inject({
+      method: "POST",
+      url: "/auth/password/login",
+      payload: { identifier: "student@example.com", password: "correct-horse-battery" },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().isAdmin).toBe(false);
+    expect(verifyAuthToken(res.json().token).role).toBeUndefined();
+  });
+
+  async function createUserFor(userRepo: InMemoryUserRepository, identifier: string) {
+    const { user } = await userRepo.findOrCreateByIdentifier(identifier, true);
+    return user;
+  }
+});
+
+describe("admin login when not configured", () => {
+  const originalJwtSecret = process.env.JWT_SECRET;
+  const originalAdminUsername = process.env.ADMIN_USERNAME;
+  const originalAdminPasswordHash = process.env.ADMIN_PASSWORD_HASH;
+
+  beforeAll(() => {
+    process.env.JWT_SECRET = "test-secret";
+    delete process.env.ADMIN_USERNAME;
+    delete process.env.ADMIN_PASSWORD_HASH;
+  });
+
+  afterAll(() => {
+    process.env.JWT_SECRET = originalJwtSecret;
+    process.env.ADMIN_USERNAME = originalAdminUsername;
+    process.env.ADMIN_PASSWORD_HASH = originalAdminPasswordHash;
+  });
+
+  it("falls through to the normal (failing) user lookup when admin credentials aren't configured", async () => {
+    const app = buildApp();
+    const res = await app.inject({
+      method: "POST",
+      url: "/auth/password/login",
+      payload: { identifier: "admin", password: "anything" },
+    });
+
+    expect(res.statusCode).toBe(401);
+    expect(res.json()).toEqual({ error: "invalid credentials" });
+  });
+});
+
+describe("blocked users are rejected at login", () => {
+  const originalJwtSecret = process.env.JWT_SECRET;
+
+  beforeAll(() => {
+    process.env.JWT_SECRET = "test-secret";
+  });
+
+  afterAll(() => {
+    process.env.JWT_SECRET = originalJwtSecret;
+  });
+
+  it("rejects password login for a blocked user, even with the correct password", async () => {
+    const userRepo = new InMemoryUserRepository();
+    const user = await createUserFor(userRepo, "blocked@example.com");
+    const hash = await bcrypt.hash("correct-horse-battery", BCRYPT_COST_FACTOR);
+    userRepo.seedPassword(user.id, hash, false);
+    await userRepo.blockByEmail("blocked@example.com");
+
+    const app = buildApp(undefined, undefined, userRepo);
+    const res = await app.inject({
+      method: "POST",
+      url: "/auth/password/login",
+      payload: { identifier: "blocked@example.com", password: "correct-horse-battery" },
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toEqual({ error: "this account has been blocked" });
+  });
+
+  it("allows login again once unblocked", async () => {
+    const userRepo = new InMemoryUserRepository();
+    const user = await createUserFor(userRepo, "reinstated@example.com");
+    const hash = await bcrypt.hash("correct-horse-battery", BCRYPT_COST_FACTOR);
+    userRepo.seedPassword(user.id, hash, false);
+    await userRepo.blockByEmail("reinstated@example.com");
+    await userRepo.unblockByEmail("reinstated@example.com");
+
+    const app = buildApp(undefined, undefined, userRepo);
+    const res = await app.inject({
+      method: "POST",
+      url: "/auth/password/login",
+      payload: { identifier: "reinstated@example.com", password: "correct-horse-battery" },
+    });
+
+    expect(res.statusCode).toBe(200);
+  });
+
+  async function createUserFor(userRepo: InMemoryUserRepository, identifier: string) {
+    const { user } = await userRepo.findOrCreateByIdentifier(identifier, true);
+    return user;
+  }
+});

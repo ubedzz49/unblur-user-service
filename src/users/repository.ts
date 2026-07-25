@@ -8,6 +8,7 @@ export interface User {
   photoUrl: string | null;
   bio: string | null;
   aiNotesAndTranscriptsEnabled: boolean;
+  blockedAt: string | null;
   createdAt: string;
 }
 
@@ -27,6 +28,7 @@ export interface UserPasswordInfo {
   id: string;
   passwordHash: string | null;
   mustResetPassword: boolean;
+  blockedAt: string | null;
 }
 
 export interface UserRepository {
@@ -39,6 +41,11 @@ export interface UserRepository {
   // needed by POST /users/me/password to check the caller's current password before changing it
   findPasswordInfoById(userId: string): Promise<UserPasswordInfo | null>;
   setPassword(userId: string, passwordHash: string, mustResetPassword: boolean): Promise<void>;
+
+  // admin-only
+  listUsers(limit: number, offset: number): Promise<User[]>;
+  blockByEmail(email: string): Promise<User | null>;
+  unblockByEmail(email: string): Promise<User | null>;
 }
 
 // test-only -- avoids CI needing a real Postgres instance
@@ -62,6 +69,7 @@ export class InMemoryUserRepository implements UserRepository {
       photoUrl: null,
       bio: null,
       aiNotesAndTranscriptsEnabled: false,
+      blockedAt: null,
       createdAt: new Date(0).toISOString(),
     };
     this.usersById.set(id, user);
@@ -78,13 +86,23 @@ export class InMemoryUserRepository implements UserRepository {
     const id = this.idsByIdentifier.get(identifier);
     if (!id) return null;
     const pw = this.passwordsById.get(id) ?? { passwordHash: null, mustResetPassword: false };
-    return { id, passwordHash: pw.passwordHash, mustResetPassword: pw.mustResetPassword };
+    return {
+      id,
+      passwordHash: pw.passwordHash,
+      mustResetPassword: pw.mustResetPassword,
+      blockedAt: this.usersById.get(id)?.blockedAt ?? null,
+    };
   }
 
   async findPasswordInfoById(userId: string): Promise<UserPasswordInfo | null> {
     if (!this.usersById.has(userId)) return null;
     const pw = this.passwordsById.get(userId) ?? { passwordHash: null, mustResetPassword: false };
-    return { id: userId, passwordHash: pw.passwordHash, mustResetPassword: pw.mustResetPassword };
+    return {
+      id: userId,
+      passwordHash: pw.passwordHash,
+      mustResetPassword: pw.mustResetPassword,
+      blockedAt: this.usersById.get(userId)?.blockedAt ?? null,
+    };
   }
 
   async setPassword(userId: string, passwordHash: string, mustResetPassword: boolean): Promise<void> {
@@ -109,6 +127,30 @@ export class InMemoryUserRepository implements UserRepository {
       aiNotesAndTranscriptsEnabled: update.aiNotesAndTranscriptsEnabled ?? user.aiNotesAndTranscriptsEnabled,
     };
     this.usersById.set(id, updated);
+    return updated;
+  }
+
+  async listUsers(limit: number, offset: number): Promise<User[]> {
+    return Array.from(this.usersById.values())
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .slice(offset, offset + limit);
+  }
+
+  async blockByEmail(email: string): Promise<User | null> {
+    const id = this.idsByIdentifier.get(email);
+    const user = id ? this.usersById.get(id) : undefined;
+    if (!user) return null;
+    const updated: User = { ...user, blockedAt: new Date().toISOString() };
+    this.usersById.set(user.id, updated);
+    return updated;
+  }
+
+  async unblockByEmail(email: string): Promise<User | null> {
+    const id = this.idsByIdentifier.get(email);
+    const user = id ? this.usersById.get(id) : undefined;
+    if (!user) return null;
+    const updated: User = { ...user, blockedAt: null };
+    this.usersById.set(user.id, updated);
     return updated;
   }
 }

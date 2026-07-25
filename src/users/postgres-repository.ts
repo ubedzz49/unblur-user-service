@@ -9,6 +9,7 @@ interface UserRow {
   photo_url: string | null;
   bio: string | null;
   ai_notes_and_transcripts_enabled: boolean;
+  blocked_at: string | null;
   created_at: string;
 }
 
@@ -21,6 +22,7 @@ function toUser(row: UserRow): User {
     photoUrl: row.photo_url,
     bio: row.bio,
     aiNotesAndTranscriptsEnabled: row.ai_notes_and_transcripts_enabled,
+    blockedAt: row.blocked_at,
     createdAt: row.created_at,
   };
 }
@@ -88,23 +90,37 @@ export class PostgresUserRepository implements UserRepository {
   async findByIdentifierWithPassword(identifier: string): Promise<UserPasswordInfo | null> {
     const isEmail = identifier.includes("@");
     const column = isEmail ? "email" : "phone";
-    const result = await this.pool.query<{ id: string; password_hash: string | null; must_reset_password: boolean }>(
-      `SELECT id, password_hash, must_reset_password FROM users WHERE ${column} = $1`,
-      [identifier],
-    );
+    const result = await this.pool.query<{
+      id: string;
+      password_hash: string | null;
+      must_reset_password: boolean;
+      blocked_at: string | null;
+    }>(`SELECT id, password_hash, must_reset_password, blocked_at FROM users WHERE ${column} = $1`, [identifier]);
     if (result.rows.length === 0) return null;
     const row = result.rows[0];
-    return { id: row.id, passwordHash: row.password_hash, mustResetPassword: row.must_reset_password };
+    return {
+      id: row.id,
+      passwordHash: row.password_hash,
+      mustResetPassword: row.must_reset_password,
+      blockedAt: row.blocked_at,
+    };
   }
 
   async findPasswordInfoById(userId: string): Promise<UserPasswordInfo | null> {
-    const result = await this.pool.query<{ id: string; password_hash: string | null; must_reset_password: boolean }>(
-      "SELECT id, password_hash, must_reset_password FROM users WHERE id = $1",
-      [userId],
-    );
+    const result = await this.pool.query<{
+      id: string;
+      password_hash: string | null;
+      must_reset_password: boolean;
+      blocked_at: string | null;
+    }>("SELECT id, password_hash, must_reset_password, blocked_at FROM users WHERE id = $1", [userId]);
     if (result.rows.length === 0) return null;
     const row = result.rows[0];
-    return { id: row.id, passwordHash: row.password_hash, mustResetPassword: row.must_reset_password };
+    return {
+      id: row.id,
+      passwordHash: row.password_hash,
+      mustResetPassword: row.must_reset_password,
+      blockedAt: row.blocked_at,
+    };
   }
 
   async setPassword(userId: string, passwordHash: string, mustResetPassword: boolean): Promise<void> {
@@ -112,5 +128,29 @@ export class PostgresUserRepository implements UserRepository {
       "UPDATE users SET password_hash = $2, must_reset_password = $3, updated_at = now() WHERE id = $1",
       [userId, passwordHash, mustResetPassword],
     );
+  }
+
+  async listUsers(limit: number, offset: number): Promise<User[]> {
+    const result = await this.pool.query<UserRow>(
+      "SELECT * FROM users ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+      [limit, offset],
+    );
+    return result.rows.map(toUser);
+  }
+
+  async blockByEmail(email: string): Promise<User | null> {
+    const result = await this.pool.query<UserRow>(
+      "UPDATE users SET blocked_at = now(), updated_at = now() WHERE email = $1 RETURNING *",
+      [email],
+    );
+    return result.rows.length > 0 ? toUser(result.rows[0]) : null;
+  }
+
+  async unblockByEmail(email: string): Promise<User | null> {
+    const result = await this.pool.query<UserRow>(
+      "UPDATE users SET blocked_at = NULL, updated_at = now() WHERE email = $1 RETURNING *",
+      [email],
+    );
+    return result.rows.length > 0 ? toUser(result.rows[0]) : null;
   }
 }

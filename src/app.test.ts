@@ -148,6 +148,28 @@ describe("OTP verify links to a real user record", () => {
     expect(me1.json().id).toBe(me2.json().id);
     expect(me1.json().phone).toBe("+911234567890");
   });
+
+  it("rejects otp verify for a blocked user, without issuing a token", async () => {
+    const userRepo = new InMemoryUserRepository();
+    await userRepo.findOrCreateByIdentifier("+919999999999", false);
+    // InMemoryUserRepository's identifier map isn't email-specific like the real Postgres
+    // column lookup is, so blockByEmail works against this phone identifier too here -- used
+    // purely so the otp can be read directly off the send response (email identifiers never
+    // include it, see the "OTP via email" describe block above)
+    await userRepo.blockByEmail("+919999999999");
+    const otpStore = new InMemoryOtpStore();
+    const app = buildApp(otpStore, new RecordingEmailSender(), userRepo);
+
+    const send = await app.inject({ method: "POST", url: "/auth/otp/send", payload: { identifier: "+919999999999" } });
+    const verify = await app.inject({
+      method: "POST",
+      url: "/auth/otp/verify",
+      payload: { identifier: "+919999999999", otp: send.json().otp },
+    });
+
+    expect(verify.statusCode).toBe(403);
+    expect(verify.json()).toEqual({ error: "this account has been blocked" });
+  });
 });
 
 describe("GET /users/me", () => {
@@ -1265,5 +1287,208 @@ describe("POST /internal/users/:id/stats/record-rating", () => {
     // of which one the event loop happened to apply first
     expect(stats?.ratingCount).toBe(2);
     expect(stats?.avgRating).toBe(4);
+  });
+});
+
+describe("admin endpoints", () => {
+  const originalJwtSecret = process.env.JWT_SECRET;
+
+  beforeAll(() => {
+    process.env.JWT_SECRET = "test-secret";
+  });
+
+  afterAll(() => {
+    process.env.JWT_SECRET = originalJwtSecret;
+  });
+
+  function adminToken() {
+    return signAuthToken("admin", "admin");
+  }
+
+  describe("GET /admin/users", () => {
+    it("401s with no token", async () => {
+      const app = buildApp();
+      const res = await app.inject({ method: "GET", url: "/admin/users" });
+      expect(res.statusCode).toBe(401);
+    });
+
+    it("403s a non-admin token", async () => {
+      const app = buildApp();
+      const res = await app.inject({
+        method: "GET",
+        url: "/admin/users",
+        headers: { authorization: `Bearer ${signAuthToken("some-real-user-id")}` },
+      });
+      expect(res.statusCode).toBe(403);
+    });
+
+    it("lists users for an admin token", async () => {
+      const userRepo = new InMemoryUserRepository();
+      await userRepo.findOrCreateByIdentifier("a@example.com", true);
+      await userRepo.findOrCreateByIdentifier("b@example.com", true);
+      const app = buildApp(undefined, undefined, userRepo);
+
+      const res = await app.inject({
+        method: "GET",
+        url: "/admin/users",
+        headers: { authorization: `Bearer ${adminToken()}` },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toHaveLength(2);
+    });
+  });
+
+  describe("POST /admin/users/block and /unblock", () => {
+    it("blocks a user by email, then unblocks them", async () => {
+      const userRepo = new InMemoryUserRepository();
+      await userRepo.findOrCreateByIdentifier("target@example.com", true);
+      const app = buildApp(undefined, undefined, userRepo);
+
+      const blockRes = await app.inject({
+        method: "POST",
+        url: "/admin/users/block",
+        headers: { authorization: `Bearer ${adminToken()}` },
+        payload: { email: "target@example.com" },
+      });
+      expect(blockRes.statusCode).toBe(200);
+      expect(blockRes.json().blockedAt).toBeTruthy();
+
+      const unblockRes = await app.inject({
+        method: "POST",
+        url: "/admin/users/unblock",
+        headers: { authorization: `Bearer ${adminToken()}` },
+        payload: { email: "target@example.com" },
+      });
+      expect(unblockRes.statusCode).toBe(200);
+      expect(unblockRes.json().blockedAt).toBeNull();
+    });
+
+    it("404s blocking an unknown email", async () => {
+      const app = buildApp();
+      const res = await app.inject({
+        method: "POST",
+        url: "/admin/users/block",
+        headers: { authorization: `Bearer ${adminToken()}` },
+        payload: { email: "nobody@example.com" },
+      });
+      expect(res.statusCode).toBe(404);
+    });
+
+    it("403s a non-admin trying to block a user", async () => {
+      const app = buildApp();
+      const res = await app.inject({
+        method: "POST",
+        url: "/admin/users/block",
+        headers: { authorization: `Bearer ${signAuthToken("some-real-user-id")}` },
+        payload: { email: "nobody@example.com" },
+      });
+      expect(res.statusCode).toBe(403);
+    });
+  });
+
+  describe("POST /admin/expertise", () => {
+    it("creates a topic and returns it", async () => {
+      const expertiseRepo = new InMemoryExpertiseRepository();
+      const matchingClient = new FakeMatchingClient();
+      const app = buildApp(undefined, undefined, undefined, undefined, expertiseRepo, matchingClient);
+
+      const res = await app.inject({
+        method: "POST",
+        url: "/admin/expertise",
+        headers: { authorization: `Bearer ${adminToken()}` },
+        payload: { subjectName: "Quantum Computing", levelName: "Intro" },
+      });
+      expect(res.statusCode).toBe(201);
+      expect(res.json().typeName).toBe("Quantum Computing");
+      expect(matchingClient.calls).toHaveLength(1);
+    });
+
+    it("400s a missing subjectName", async () => {
+      const app = buildApp();
+      const res = await app.inject({
+        method: "POST",
+        url: "/admin/expertise",
+        headers: { authorization: `Bearer ${adminToken()}` },
+        payload: {},
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it("403s a non-admin token", async () => {
+      const app = buildApp();
+      const res = await app.inject({
+        method: "POST",
+        url: "/admin/expertise",
+        headers: { authorization: `Bearer ${signAuthToken("some-real-user-id")}` },
+        payload: { subjectName: "x" },
+      });
+      expect(res.statusCode).toBe(403);
+    });
+  });
+
+  describe("POST /admin/expertise/import", () => {
+    it("bulk-creates multiple topics, reporting per-node failures separately", async () => {
+      const expertiseRepo = new InMemoryExpertiseRepository();
+      const matchingClient = new FakeMatchingClient();
+      const app = buildApp(undefined, undefined, undefined, undefined, expertiseRepo, matchingClient);
+
+      const res = await app.inject({
+        method: "POST",
+        url: "/admin/expertise/import",
+        headers: { authorization: `Bearer ${adminToken()}` },
+        payload: {
+          nodes: [
+            { subjectName: "Rocket Science", levelName: "Beginner" },
+            { subjectName: "" },
+            { subjectName: "Astrophysics" },
+          ],
+        },
+      });
+      expect(res.statusCode).toBe(201);
+      const body = res.json();
+      expect(body.created).toHaveLength(2);
+      expect(body.failed).toHaveLength(1);
+      expect(matchingClient.calls).toHaveLength(2);
+    });
+
+    it("400s a non-array nodes body", async () => {
+      const app = buildApp();
+      const res = await app.inject({
+        method: "POST",
+        url: "/admin/expertise/import",
+        headers: { authorization: `Bearer ${adminToken()}` },
+        payload: { nodes: "not-an-array" },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+  });
+
+  describe("DELETE /admin/expertise/:levelId", () => {
+    it("removes an existing topic level", async () => {
+      const expertiseRepo = new InMemoryExpertiseRepository();
+      const app = buildApp(undefined, undefined, undefined, undefined, expertiseRepo);
+      const created = await expertiseRepo.findOrCreateCustom("Marine Biology", "Intro");
+
+      const res = await app.inject({
+        method: "DELETE",
+        url: `/admin/expertise/${created.expertiseLevelId}`,
+        headers: { authorization: `Bearer ${adminToken()}` },
+      });
+      expect(res.statusCode).toBe(200);
+
+      const options = await expertiseRepo.listOptions();
+      const stillPresent = options.some((t) => t.levels.some((l) => l.id === created.expertiseLevelId));
+      expect(stillPresent).toBe(false);
+    });
+
+    it("404s an unknown levelId", async () => {
+      const app = buildApp();
+      const res = await app.inject({
+        method: "DELETE",
+        url: "/admin/expertise/does-not-exist",
+        headers: { authorization: `Bearer ${adminToken()}` },
+      });
+      expect(res.statusCode).toBe(404);
+    });
   });
 });
