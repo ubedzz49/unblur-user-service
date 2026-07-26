@@ -849,6 +849,77 @@ describe("GET /users/:id/public", () => {
   });
 });
 
+describe("POST /internal/users/bulk", () => {
+  const originalInternalToken = process.env.INTERNAL_SERVICE_TOKEN;
+
+  beforeAll(() => {
+    process.env.JWT_SECRET = "test-secret";
+    process.env.INTERNAL_SERVICE_TOKEN = "test-internal-secret";
+  });
+
+  afterAll(() => {
+    process.env.INTERNAL_SERVICE_TOKEN = originalInternalToken;
+  });
+
+  function build() {
+    const userRepo = new InMemoryUserRepository();
+    const app = buildApp(
+      new InMemoryOtpStore(),
+      new RecordingEmailSender(),
+      userRepo,
+      undefined,
+      new InMemoryExpertiseRepository(),
+      new FakeMatchingClient(),
+      new InMemoryStatsRepository(),
+    );
+    return { app, userRepo };
+  }
+
+  it("returns profile + the ai-notes toggle for each found user, ignoring unknown ids", async () => {
+    const { app, userRepo } = build();
+    const { user: enabled } = await userRepo.findOrCreateByIdentifier("poster@example.com", true);
+    await userRepo.updateProfile(enabled.id, { name: "Poster", aiNotesAndTranscriptsEnabled: true });
+    const { user: disabled } = await userRepo.findOrCreateByIdentifier("resolver@example.com", true);
+    await userRepo.updateProfile(disabled.id, { name: "Resolver" });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/internal/users/bulk",
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { userIds: [enabled.id, disabled.id, "00000000-0000-0000-0000-000000000000"] },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({
+      users: [
+        { id: enabled.id, email: "poster@example.com", name: "Poster", aiNotesAndTranscriptsEnabled: true },
+        { id: disabled.id, email: "resolver@example.com", name: "Resolver", aiNotesAndTranscriptsEnabled: false },
+      ],
+    });
+  });
+
+  it("rejects a request with no internal token header", async () => {
+    const { app } = build();
+    const res = await app.inject({
+      method: "POST",
+      url: "/internal/users/bulk",
+      payload: { userIds: [] },
+    });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("rejects a non-uuid entry in userIds", async () => {
+    const { app } = build();
+    const res = await app.inject({
+      method: "POST",
+      url: "/internal/users/bulk",
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { userIds: ["not-a-uuid"] },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+});
+
 describe("POST /internal/users/:id/stats/increment-minutes-resolved", () => {
   const originalInternalToken = process.env.INTERNAL_SERVICE_TOKEN;
 

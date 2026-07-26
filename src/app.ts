@@ -20,6 +20,12 @@ import { HttpMatchingClient, MatchingClient } from "./matching/client.js";
 import { InMemoryStatsRepository, StatsRepository } from "./stats/repository.js";
 import { requireInternalServiceToken } from "./internal-auth.js";
 
+interface BulkUsersBody {
+  userIds?: string[];
+}
+
+const MAX_BULK_USER_IDS = 20;
+
 interface SendOtpBody {
   identifier: string;
 }
@@ -601,6 +607,33 @@ export function buildApp(
       return reply.send({ avgRating: result.avgRating, ratingCount: result.ratingCount });
     },
   );
+
+  // service-to-service only -- lets AI Notes Service (and any future caller) resolve a small
+  // participant list to profile+toggle in one round trip instead of N calls. Looped findById
+  // rather than a new bulk repository method -- session participant lists are 2-3 users
+  // (poster+resolver today), not worth a new SQL path for.
+  app.post<{ Body: BulkUsersBody }>("/internal/users/bulk", async (request, reply) => {
+    if (!requireInternalServiceToken(request, reply)) return;
+
+    const { userIds } = request.body ?? ({} as BulkUsersBody);
+    if (!Array.isArray(userIds) || userIds.some((id) => typeof id !== "string" || !UUID_PATTERN.test(id))) {
+      return reply.code(400).send({ error: "userIds must be an array of valid uuids" });
+    }
+    if (userIds.length > MAX_BULK_USER_IDS) {
+      return reply.code(400).send({ error: `userIds cannot exceed ${MAX_BULK_USER_IDS}` });
+    }
+
+    const found = await Promise.all(userIds.map((id) => userRepository.findById(id)));
+    const users = found
+      .filter((u): u is NonNullable<typeof u> => u !== null)
+      .map((u) => ({
+        id: u.id,
+        email: u.email,
+        name: u.name,
+        aiNotesAndTranscriptsEnabled: u.aiNotesAndTranscriptsEnabled,
+      }));
+    return reply.send({ users });
+  });
 
   app.get<{ Querystring: ListUsersQuery }>("/admin/users", async (request, reply) => {
     if (!(await requireAdminAuth(request, reply))) return;
