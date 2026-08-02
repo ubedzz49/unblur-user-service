@@ -12,6 +12,7 @@ import { HttpMatchingClient } from "./matching/client.js";
 import { requireInternalServiceTokenConfigured } from "./internal-auth.js";
 import { PostgresAdminUsersRepository } from "./admin/postgres-repository.js";
 import { PostgresAuditLogRepository } from "./admin/postgres-audit-log-repository.js";
+import { HttpGatewayClient } from "./admin/gateway-client.js";
 
 const port = Number(process.env.PORT ?? 3000);
 const dbPool = buildDbPool();
@@ -51,6 +52,7 @@ runMigrations(dbPool)
       new PostgresStatsRepository(dbPool),
       adminUsersRepository,
       new PostgresAuditLogRepository(dbPool),
+      new HttpGatewayClient(),
     );
 
     return app.listen({ port, host: "0.0.0.0" }).then(() => app.log.info({ port }, "user-service listening"));

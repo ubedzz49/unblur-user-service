@@ -7,6 +7,7 @@ import { InMemoryStatsRepository } from "./stats/repository.js";
 import { InMemoryExpertiseRepository } from "./expertise/repository.js";
 import { FakeMatchingClient, MatchingClient } from "./matching/client.js";
 import { signAuthToken } from "./jwt.js";
+import { FakeGatewayClient } from "./admin/gateway-client.js";
 
 describe("GET /healthz", () => {
   it("returns ok status", async () => {
@@ -1852,6 +1853,50 @@ describe("admin endpoints", () => {
 
       const list = await app.inject({ method: "GET", url: "/admin/audit-log", headers: { authorization: `Bearer ${adminToken()}` } });
       expect(list.json().some((e: { action: string }) => e.action === "refund_booking")).toBe(true);
+    });
+  });
+
+  describe("GET/POST /admin/gateway-routes", () => {
+    it("403s a plain admin (superadmin only)", async () => {
+      const app = buildApp();
+      const res = await app.inject({ method: "GET", url: "/admin/gateway-routes", headers: { authorization: `Bearer ${adminToken()}` } });
+      expect(res.statusCode).toBe(403);
+    });
+
+    it("lets a superadmin read the current routes", async () => {
+      const gatewayClient = new FakeGatewayClient();
+      const app = buildApp(undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, gatewayClient);
+      const res = await app.inject({ method: "GET", url: "/admin/gateway-routes", headers: { authorization: `Bearer ${superadminToken()}` } });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual(gatewayClient.routes);
+    });
+
+    it("lets a superadmin replace the routing table and records an audit entry", async () => {
+      const gatewayClient = new FakeGatewayClient();
+      const app = buildApp(undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, gatewayClient);
+      const newRoutes = [{ prefix: "/doubts", upstream: "http://doubt-service" }];
+      const res = await app.inject({
+        method: "POST",
+        url: "/admin/gateway-routes",
+        headers: { authorization: `Bearer ${superadminToken()}` },
+        payload: newRoutes,
+      });
+      expect(res.statusCode).toBe(200);
+      expect(gatewayClient.updateCalls).toHaveLength(1);
+
+      const auditRes = await app.inject({ method: "GET", url: "/admin/audit-log", headers: { authorization: `Bearer ${adminToken()}` } });
+      expect(auditRes.json().some((e: { action: string }) => e.action === "update_gateway_routes")).toBe(true);
+    });
+
+    it("400s an empty route list", async () => {
+      const app = buildApp();
+      const res = await app.inject({
+        method: "POST",
+        url: "/admin/gateway-routes",
+        headers: { authorization: `Bearer ${superadminToken()}` },
+        payload: [],
+      });
+      expect(res.statusCode).toBe(400);
     });
   });
 });
