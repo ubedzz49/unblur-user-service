@@ -22,6 +22,7 @@ import { requireInternalServiceToken } from "./internal-auth.js";
 import { logger } from "./logger.js";
 import { AdminRole, AdminUsersRepository, InMemoryAdminUsersRepository } from "./admin/repository.js";
 import { AuditLogRepository, InMemoryAuditLogRepository } from "./admin/audit-log-repository.js";
+import { GatewayClient, FakeGatewayClient, RouteConfig } from "./admin/gateway-client.js";
 
 interface BulkUsersBody {
   userIds?: string[];
@@ -212,6 +213,7 @@ export function buildApp(
   statsRepository: StatsRepository = new InMemoryStatsRepository(),
   adminUsersRepository: AdminUsersRepository = new InMemoryAdminUsersRepository(),
   auditLogRepository: AuditLogRepository = new InMemoryAuditLogRepository(),
+  gatewayClient: GatewayClient = new FakeGatewayClient(),
 ): FastifyInstance {
   // request/response logging is off during tests to keep test output readable -- level
   // otherwise configurable via LOG_LEVEL (info by default) and mutable at runtime, see
@@ -928,6 +930,52 @@ export function buildApp(
       return reply.code(201).send(entry);
     },
   );
+
+  // superadmin-only -- gateway route management (Version 9's "admin/config service for
+  // managing gateway routes"). Proxies to gateway-core's own /internal/routes server-side so
+  // the internal service token this call needs is never exposed to the browser.
+  app.get("/admin/gateway-routes", async (request, reply) => {
+    if (!(await requireSuperadminAuth(request, reply))) return;
+    try {
+      const routes = await gatewayClient.getRoutes();
+      return reply.send(routes);
+    } catch (err) {
+      request.log.error({ err }, "failed to fetch gateway routes");
+      return reply.code(502).send({ error: "couldn't reach the gateway right now, try again" });
+    }
+  });
+
+  app.post<{ Body: RouteConfig[] }>("/admin/gateway-routes", async (request, reply) => {
+    if (!(await requireSuperadminAuth(request, reply))) return;
+
+    const routes = request.body ?? [];
+    if (!Array.isArray(routes) || routes.length === 0) {
+      return reply.code(400).send({ error: "routes must be a non-empty array" });
+    }
+    for (const r of routes) {
+      if (typeof r.prefix !== "string" || typeof r.upstream !== "string") {
+        return reply.code(400).send({ error: "each route needs a prefix and an upstream" });
+      }
+    }
+
+    try {
+      const updated = await gatewayClient.updateRoutes(routes);
+      const admin = adminContextFrom(request);
+      await auditLogRepository.create({
+        adminUserId: admin.adminUserId,
+        adminUsername: admin.username,
+        action: "update_gateway_routes",
+        targetType: "gateway",
+        targetId: "routes",
+        metadata: { routeCount: updated.length },
+      });
+      request.log.info({ routeCount: updated.length }, "gateway routes updated by admin");
+      return reply.send(updated);
+    } catch (err) {
+      request.log.error({ err }, "failed to update gateway routes");
+      return reply.code(502).send({ error: err instanceof Error ? err.message : "couldn't update gateway routes" });
+    }
+  });
 
   // shared by both admin expertise routes below -- same find-or-create + best-effort embed
   // pattern as the user-facing /expertise-options/custom endpoint above
