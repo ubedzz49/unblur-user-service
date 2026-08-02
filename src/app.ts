@@ -20,6 +20,8 @@ import { HttpMatchingClient, MatchingClient } from "./matching/client.js";
 import { InMemoryStatsRepository, StatsRepository } from "./stats/repository.js";
 import { requireInternalServiceToken } from "./internal-auth.js";
 import { logger } from "./logger.js";
+import { AdminRole, AdminUsersRepository, InMemoryAdminUsersRepository } from "./admin/repository.js";
+import { AuditLogRepository, InMemoryAuditLogRepository } from "./admin/audit-log-repository.js";
 
 interface BulkUsersBody {
   userIds?: string[];
@@ -142,7 +144,9 @@ async function requireAuth(request: FastifyRequest, reply: FastifyReply): Promis
 
 // this service verifies the JWT itself (it's the one that signs them), so the admin check reads
 // the role claim directly off the token rather than trusting a gateway-forwarded header the way
-// every other service's admin routes do
+// every other service's admin routes do. superadmin is a strictly higher tier than admin
+// (per Version 9 RBAC) -- anywhere requireAdminAuth allows "admin" through, "superadmin" is
+// allowed too.
 async function requireAdminAuth(request: FastifyRequest, reply: FastifyReply): Promise<boolean> {
   const header = request.headers.authorization;
   const token = header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : undefined;
@@ -153,7 +157,7 @@ async function requireAdminAuth(request: FastifyRequest, reply: FastifyReply): P
 
   try {
     const payload = verifyAuthToken(token);
-    if (payload.role !== "admin") {
+    if (payload.role !== "admin" && payload.role !== "superadmin") {
       reply.code(403).send({ error: "admin access required" });
       return false;
     }
@@ -165,6 +169,39 @@ async function requireAdminAuth(request: FastifyRequest, reply: FastifyReply): P
   }
 }
 
+// only superadmin can manage other admin accounts or read the audit log -- a strictly narrower
+// gate than requireAdminAuth, not a separate concept
+async function requireSuperadminAuth(request: FastifyRequest, reply: FastifyReply): Promise<boolean> {
+  const header = request.headers.authorization;
+  const token = header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : undefined;
+  if (!token) {
+    reply.code(401).send({ error: "missing bearer token" });
+    return false;
+  }
+
+  try {
+    const payload = verifyAuthToken(token);
+    if (payload.role !== "superadmin") {
+      reply.code(403).send({ error: "superadmin access required" });
+      return false;
+    }
+    return true;
+  } catch (err) {
+    request.log.warn({ err }, "superadmin auth rejected: invalid or expired token");
+    reply.code(401).send({ error: "invalid or expired token" });
+    return false;
+  }
+}
+
+// extracts {adminUserId, username, role} from an already-verified admin bearer token, for
+// audit-log entries -- callers must have already passed requireAdminAuth/requireSuperadminAuth
+function adminContextFrom(request: FastifyRequest): { adminUserId: string; username: string; role: string } {
+  const header = request.headers.authorization as string;
+  const token = header.slice("Bearer ".length);
+  const payload = verifyAuthToken(token);
+  return { adminUserId: payload.sub, username: payload.username ?? "unknown", role: payload.role ?? "admin" };
+}
+
 export function buildApp(
   otpStore: OtpStore = new InMemoryOtpStore(),
   emailSender: EmailSender = new RecordingEmailSender(),
@@ -173,6 +210,8 @@ export function buildApp(
   expertiseRepository: ExpertiseRepository = new InMemoryExpertiseRepository(),
   matchingClient: MatchingClient = new HttpMatchingClient(),
   statsRepository: StatsRepository = new InMemoryStatsRepository(),
+  adminUsersRepository: AdminUsersRepository = new InMemoryAdminUsersRepository(),
+  auditLogRepository: AuditLogRepository = new InMemoryAuditLogRepository(),
 ): FastifyInstance {
   // request/response logging is off during tests to keep test output readable -- level
   // otherwise configurable via LOG_LEVEL (info by default) and mutable at runtime, see
@@ -274,22 +313,20 @@ export function buildApp(
       return reply.code(400).send({ error: "identifier and password are required" });
     }
 
-    // the fixed admin login -- a distinct credential pair (username + bcrypt hash, both from
-    // Secrets Manager, never in code), checked before any real-user lookup. No real user can
-    // ever collide with this: ADMIN_USERNAME isn't email/phone-shaped, so it can never match a
-    // real identifier. Falls through to the dummy-hash compare below (not a separate early
-    // return before that) so a wrong admin password takes the same code path/timing as any
-    // other wrong-password attempt.
-    const adminUsername = process.env.ADMIN_USERNAME;
-    const adminPasswordHash = process.env.ADMIN_PASSWORD_HASH;
-    if (adminUsername && adminPasswordHash && identifier === adminUsername) {
-      const adminMatches = await bcrypt.compare(password, adminPasswordHash);
+    // real admin accounts (Version 9 RBAC, admin_users table) -- checked before any real-user
+    // lookup. An admin username is never email/phone-shaped (enforced at creation time), so it
+    // can never collide with a real identifier. Falls through to the dummy-hash compare below
+    // (not a separate early return before that) so a wrong admin password takes the same code
+    // path/timing as any other wrong-password attempt.
+    const adminAccount = await adminUsersRepository.findByUsername(identifier);
+    if (adminAccount) {
+      const adminMatches = await bcrypt.compare(password, adminAccount.passwordHash);
       if (!adminMatches) {
         request.log.warn("admin password login rejected: invalid credentials");
         return reply.code(401).send({ error: "invalid credentials" });
       }
-      const token = signAuthToken("admin", "admin");
-      request.log.info("admin password login succeeded");
+      const token = signAuthToken(adminAccount.id, adminAccount.role, adminAccount.username);
+      request.log.info({ adminUserId: adminAccount.id, role: adminAccount.role }, "admin password login succeeded");
       return reply.send({ token, mustResetPassword: false, isAdmin: true });
     }
 
@@ -753,6 +790,15 @@ export function buildApp(
     if (!user) {
       return reply.code(404).send({ error: "no user found with that email" });
     }
+    const admin = adminContextFrom(request);
+    await auditLogRepository.create({
+      adminUserId: admin.adminUserId,
+      adminUsername: admin.username,
+      action: "block_user",
+      targetType: "user",
+      targetId: user.id,
+      metadata: { email },
+    });
     request.log.info({ userId: user.id }, "user blocked by admin");
     return reply.send(user);
   });
@@ -769,9 +815,119 @@ export function buildApp(
     if (!user) {
       return reply.code(404).send({ error: "no user found with that email" });
     }
+    const admin = adminContextFrom(request);
+    await auditLogRepository.create({
+      adminUserId: admin.adminUserId,
+      adminUsername: admin.username,
+      action: "unblock_user",
+      targetType: "user",
+      targetId: user.id,
+      metadata: { email },
+    });
     request.log.info({ userId: user.id }, "user unblocked by admin");
     return reply.send(user);
   });
+
+  // Version 9 RBAC: real, multiple admin accounts -- superadmin-only, replacing the single
+  // fixed username/password pair
+  app.get("/admin/admin-users", async (request, reply) => {
+    if (!(await requireSuperadminAuth(request, reply))) return;
+    const admins = await adminUsersRepository.list();
+    return reply.send(admins.map((a) => ({ id: a.id, username: a.username, role: a.role, createdAt: a.createdAt })));
+  });
+
+  app.post<{ Body: { username?: string; password?: string; role?: AdminRole } }>("/admin/admin-users", async (request, reply) => {
+    if (!(await requireSuperadminAuth(request, reply))) return;
+
+    const { username, password, role } = request.body ?? {};
+    if (typeof username !== "string" || username.trim().length === 0) {
+      return reply.code(400).send({ error: "username is required" });
+    }
+    if (typeof password !== "string" || password.length < 8) {
+      return reply.code(400).send({ error: "password must be at least 8 characters" });
+    }
+    if (role !== "admin" && role !== "superadmin") {
+      return reply.code(400).send({ error: "role must be admin or superadmin" });
+    }
+    if (EMAIL_PATTERN.test(username.trim())) {
+      // admin usernames must never be email-shaped -- that's exactly what keeps a real user's
+      // identifier from ever colliding with an admin account at login time
+      return reply.code(400).send({ error: "username must not look like an email address" });
+    }
+
+    const existing = await adminUsersRepository.findByUsername(username.trim());
+    if (existing) {
+      return reply.code(409).send({ error: "an admin with that username already exists" });
+    }
+
+    const passwordHash = await bcrypt.hash(password, BCRYPT_COST_FACTOR);
+    const created = await adminUsersRepository.create({ username: username.trim(), passwordHash, role });
+
+    const admin = adminContextFrom(request);
+    await auditLogRepository.create({
+      adminUserId: admin.adminUserId,
+      adminUsername: admin.username,
+      action: "create_admin_user",
+      targetType: "admin_user",
+      targetId: created.id,
+      metadata: { username: created.username, role: created.role },
+    });
+    request.log.info({ createdAdminId: created.id, role: created.role }, "admin account created");
+    return reply.code(201).send({ id: created.id, username: created.username, role: created.role, createdAt: created.createdAt });
+  });
+
+  app.delete<{ Params: { id: string } }>("/admin/admin-users/:id", async (request, reply) => {
+    if (!(await requireSuperadminAuth(request, reply))) return;
+
+    const admin = adminContextFrom(request);
+    if (request.params.id === admin.adminUserId) {
+      return reply.code(400).send({ error: "cannot revoke your own admin account" });
+    }
+
+    const target = await adminUsersRepository.findById(request.params.id);
+    if (!target) {
+      return reply.code(404).send({ error: "admin user not found" });
+    }
+
+    await adminUsersRepository.delete(target.id);
+    await auditLogRepository.create({
+      adminUserId: admin.adminUserId,
+      adminUsername: admin.username,
+      action: "revoke_admin_user",
+      targetType: "admin_user",
+      targetId: target.id,
+      metadata: { username: target.username, role: target.role },
+    });
+    request.log.info({ revokedAdminId: target.id }, "admin account revoked");
+    return reply.code(204).send();
+  });
+
+  // any admin can read the audit log (transparency), only superadmin can manage accounts -- a
+  // deliberately asymmetric gate
+  app.get<{ Querystring: { limit?: string } }>("/admin/audit-log", async (request, reply) => {
+    if (!(await requireAdminAuth(request, reply))) return;
+    const limit = Math.min(Number(request.query.limit ?? 100) || 100, 500);
+    const entries = await auditLogRepository.list(limit);
+    return reply.send(entries);
+  });
+
+  // service-to-service only -- every other service's admin-gated action (refund, resolve
+  // complaint, cancel seminar/gd, send an ad-hoc notification) calls this so every admin action
+  // lands in one queryable place, not scattered structured log lines per service
+  app.post<{ Body: { adminUserId?: string; adminUsername?: string; action?: string; targetType?: string; targetId?: string; metadata?: Record<string, unknown> } }>(
+    "/internal/admin-audit-log",
+    async (request, reply) => {
+      if (!requireInternalServiceToken(request, reply)) return;
+
+      const { adminUserId, adminUsername, action, targetType, targetId, metadata } = request.body ?? {};
+      if (!adminUserId || !adminUsername || !action || !targetType || !targetId) {
+        return reply.code(400).send({ error: "adminUserId, adminUsername, action, targetType, and targetId are required" });
+      }
+
+      const entry = await auditLogRepository.create({ adminUserId, adminUsername, action, targetType, targetId, metadata });
+      return reply.code(201).send(entry);
+    },
+  );
 
   // shared by both admin expertise routes below -- same find-or-create + best-effort embed
   // pattern as the user-facing /expertise-options/custom endpoint above

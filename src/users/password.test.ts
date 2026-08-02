@@ -3,6 +3,7 @@ import { describe, expect, it, beforeAll, afterAll } from "vitest";
 import { buildApp } from "../app.js";
 import { InMemoryUserRepository } from "./repository.js";
 import { verifyAuthToken } from "../jwt.js";
+import { InMemoryAdminUsersRepository } from "../admin/repository.js";
 
 const BCRYPT_COST_FACTOR = 12;
 
@@ -205,23 +206,25 @@ describe("password backfill semantics (repository-level)", () => {
 
 describe("admin login via /auth/password/login", () => {
   const originalJwtSecret = process.env.JWT_SECRET;
-  const originalAdminUsername = process.env.ADMIN_USERNAME;
-  const originalAdminPasswordHash = process.env.ADMIN_PASSWORD_HASH;
 
-  beforeAll(async () => {
+  beforeAll(() => {
     process.env.JWT_SECRET = "test-secret";
-    process.env.ADMIN_USERNAME = "admin";
-    process.env.ADMIN_PASSWORD_HASH = await bcrypt.hash("correct-admin-pass", BCRYPT_COST_FACTOR);
   });
 
   afterAll(() => {
     process.env.JWT_SECRET = originalJwtSecret;
-    process.env.ADMIN_USERNAME = originalAdminUsername;
-    process.env.ADMIN_PASSWORD_HASH = originalAdminPasswordHash;
   });
 
+  async function buildAppWithSeededAdmin() {
+    const adminUsersRepo = new InMemoryAdminUsersRepository();
+    const hash = await bcrypt.hash("correct-admin-pass", BCRYPT_COST_FACTOR);
+    const admin = await adminUsersRepo.create({ username: "admin", passwordHash: hash, role: "admin" });
+    const app = buildApp(undefined, undefined, undefined, undefined, undefined, undefined, undefined, adminUsersRepo);
+    return { app, admin };
+  }
+
   it("logs in as admin with the correct credentials, returning isAdmin and a role: admin token", async () => {
-    const app = buildApp();
+    const { app, admin } = await buildAppWithSeededAdmin();
     const res = await app.inject({
       method: "POST",
       url: "/auth/password/login",
@@ -232,11 +235,11 @@ describe("admin login via /auth/password/login", () => {
     const body = res.json();
     expect(body.isAdmin).toBe(true);
     expect(body.mustResetPassword).toBe(false);
-    expect(verifyAuthToken(body.token)).toMatchObject({ sub: "admin", role: "admin" });
+    expect(verifyAuthToken(body.token)).toMatchObject({ sub: admin.id, role: "admin", username: "admin" });
   });
 
   it("rejects the admin username with the wrong password", async () => {
-    const app = buildApp();
+    const { app } = await buildAppWithSeededAdmin();
     const res = await app.inject({
       method: "POST",
       url: "/auth/password/login",
