@@ -1673,3 +1673,62 @@ describe("admin endpoints", () => {
     });
   });
 });
+
+describe("log level management", () => {
+  const originalInternalToken = process.env.INTERNAL_SERVICE_TOKEN;
+
+  beforeAll(() => {
+    process.env.JWT_SECRET = "test-secret";
+    process.env.INTERNAL_SERVICE_TOKEN = "test-internal-secret";
+  });
+
+  afterAll(() => {
+    process.env.INTERNAL_SERVICE_TOKEN = originalInternalToken;
+  });
+
+  function build() {
+    const userRepo = new InMemoryUserRepository();
+    const statsRepo = new InMemoryStatsRepository();
+    const app = buildApp(new InMemoryOtpStore(), new RecordingEmailSender(), userRepo, undefined, new InMemoryExpertiseRepository(), new FakeMatchingClient(), statsRepo);
+    return { app };
+  }
+
+  it("rejects without a valid internal token", async () => {
+    const { app } = build();
+    const res = await app.inject({ method: "GET", url: "/internal/log-level" });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("reads and changes the runtime log level, then resets it", async () => {
+    const { app } = build();
+    const get = await app.inject({ method: "GET", url: "/internal/log-level", headers: { "x-internal-service-token": "test-internal-secret" } });
+    expect(get.json().level).toBe("info");
+
+    const set = await app.inject({
+      method: "POST",
+      url: "/internal/log-level",
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { level: "debug" },
+    });
+    expect(set.statusCode).toBe(200);
+    expect(set.json().level).toBe("debug");
+
+    await app.inject({
+      method: "POST",
+      url: "/internal/log-level",
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { level: "info" },
+    });
+  });
+
+  it("rejects an unrecognized level", async () => {
+    const { app } = build();
+    const res = await app.inject({
+      method: "POST",
+      url: "/internal/log-level",
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { level: "verbose" },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+});

@@ -1,5 +1,5 @@
 import bcrypt from "bcrypt";
-import Fastify, { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
+import Fastify, { FastifyBaseLogger, FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { OtpStore, InMemoryOtpStore } from "./otp/store.js";
 import { OtpService } from "./otp/service.js";
 import { signAuthToken, verifyAuthToken } from "./jwt.js";
@@ -19,6 +19,7 @@ import {
 import { HttpMatchingClient, MatchingClient } from "./matching/client.js";
 import { InMemoryStatsRepository, StatsRepository } from "./stats/repository.js";
 import { requireInternalServiceToken } from "./internal-auth.js";
+import { logger } from "./logger.js";
 
 interface BulkUsersBody {
   userIds?: string[];
@@ -173,11 +174,14 @@ export function buildApp(
   matchingClient: MatchingClient = new HttpMatchingClient(),
   statsRepository: StatsRepository = new InMemoryStatsRepository(),
 ): FastifyInstance {
-  // request/response logging is off during tests to keep test output readable --
-  // level otherwise configurable via LOG_LEVEL (info by default)
-  const app = Fastify({
-    logger: process.env.NODE_ENV === "test" ? false : { level: process.env.LOG_LEVEL ?? "info" },
-  });
+  // request/response logging is off during tests to keep test output readable -- level
+  // otherwise configurable via LOG_LEVEL (info by default) and mutable at runtime, see
+  // POST /internal/log-level below
+  const app = Fastify(
+    process.env.NODE_ENV === "test"
+      ? { logger: false }
+      : { loggerInstance: logger as unknown as FastifyBaseLogger },
+  );
 
   // Fastify's default JSON parser rejects an empty body when Content-Type: application/json is
   // set, even for methods like DELETE that legitimately have no body -- our own frontend sends
@@ -682,6 +686,28 @@ export function buildApp(
       return reply.send({ gdPoints: newTotal });
     },
   );
+
+  const VALID_LOG_LEVELS = ["info", "debug", "error"];
+
+  // runtime-mutable logging verbosity, no redeploy needed -- see src/logger.ts for the custom
+  // info<debug<error severity ordering this project uses (not pino's default trace<debug<info<
+  // warn<error<fatal). Gated the same as every other internal route.
+  app.get("/internal/log-level", async (request, reply) => {
+    if (!requireInternalServiceToken(request, reply)) return;
+    return reply.send({ level: logger.level });
+  });
+
+  app.post<{ Body: { level?: string } }>("/internal/log-level", async (request, reply) => {
+    if (!requireInternalServiceToken(request, reply)) return;
+
+    const { level } = request.body ?? {};
+    if (typeof level !== "string" || !VALID_LOG_LEVELS.includes(level)) {
+      return reply.code(400).send({ error: `level must be one of ${VALID_LOG_LEVELS.join(", ")}` });
+    }
+    logger.level = level;
+    request.log.info({ level }, "log level changed at runtime");
+    return reply.send({ level: logger.level });
+  });
 
   app.post<{ Body: BulkUsersBody }>("/internal/users/bulk", async (request, reply) => {
     if (!requireInternalServiceToken(request, reply)) return;
