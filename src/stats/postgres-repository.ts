@@ -7,6 +7,7 @@ interface StatsRow {
   avg_rating: string;
   rating_count: number;
   minutes_listener: number;
+  gd_points: string;
   updated_at: string;
 }
 
@@ -17,6 +18,7 @@ function toStats(row: StatsRow): UserStats {
     avgRating: Number(row.avg_rating),
     ratingCount: row.rating_count,
     minutesListener: row.minutes_listener,
+    gdPoints: Number(row.gd_points),
     updatedAt: row.updated_at,
   };
 }
@@ -60,5 +62,27 @@ export class PostgresStatsRepository implements StatsRepository {
     );
     if (result.rows.length === 0) return null;
     return { avgRating: Number(result.rows[0].avg_rating), ratingCount: result.rows[0].rating_count };
+  }
+
+  async incrementMinutesListener(userId: string, minutes: number): Promise<number | null> {
+    const result = await this.pool.query<{ minutes_listener: number }>(
+      `UPDATE user_stats
+         SET minutes_listener = minutes_listener + $2, updated_at = now()
+       WHERE user_id = $1
+       RETURNING minutes_listener`,
+      [userId, minutes],
+    );
+    return result.rows.length > 0 ? result.rows[0].minutes_listener : null;
+  }
+
+  async incrementGdPoints(userId: string, points: number): Promise<number | null> {
+    const result = await this.pool.query<{ gd_points: string }>(
+      `UPDATE user_stats
+         SET gd_points = gd_points + $2, updated_at = now()
+       WHERE user_id = $1
+       RETURNING gd_points`,
+      [userId, points],
+    );
+    return result.rows.length > 0 ? Number(result.rows[0].gd_points) : null;
   }
 }

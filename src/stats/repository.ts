@@ -4,6 +4,7 @@ export interface UserStats {
   avgRating: number;
   ratingCount: number;
   minutesListener: number;
+  gdPoints: number;
   updatedAt: string;
 }
 
@@ -17,6 +18,10 @@ export interface StatsRepository {
   // atomic running-average update, not read-then-write -- returns the new avgRating/ratingCount,
   // null if user doesn't exist
   recordRating(userId: string, rating: number): Promise<{ avgRating: number; ratingCount: number } | null>;
+  // atomic add -- feeds GD Service's canAttendGD eligibility threshold
+  incrementMinutesListener(userId: string, minutes: number): Promise<number | null>;
+  // atomic add -- feeds the communication score shown on the profile after GD voting
+  incrementGdPoints(userId: string, points: number): Promise<number | null>;
 }
 
 // test-only -- avoids CI needing a real Postgres instance
@@ -31,6 +36,7 @@ export class InMemoryStatsRepository implements StatsRepository {
       avgRating: 0,
       ratingCount: 0,
       minutesListener: 0,
+      gdPoints: 0,
       updatedAt: new Date(0).toISOString(),
     });
   }
@@ -64,5 +70,21 @@ export class InMemoryStatsRepository implements StatsRepository {
     const existing = this.statsByUserId.get(userId);
     if (!existing) return;
     this.statsByUserId.set(userId, { ...existing, minutesListener: minutes });
+  }
+
+  async incrementMinutesListener(userId: string, minutes: number): Promise<number | null> {
+    const existing = this.statsByUserId.get(userId);
+    if (!existing) return null;
+    const updated = { ...existing, minutesListener: existing.minutesListener + minutes, updatedAt: new Date().toISOString() };
+    this.statsByUserId.set(userId, updated);
+    return updated.minutesListener;
+  }
+
+  async incrementGdPoints(userId: string, points: number): Promise<number | null> {
+    const existing = this.statsByUserId.get(userId);
+    if (!existing) return null;
+    const updated = { ...existing, gdPoints: existing.gdPoints + points, updatedAt: new Date().toISOString() };
+    this.statsByUserId.set(userId, updated);
+    return updated.gdPoints;
   }
 }

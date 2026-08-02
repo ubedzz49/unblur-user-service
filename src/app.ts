@@ -493,6 +493,7 @@ export function buildApp(
       avgRating: stats.avgRating,
       ratingCount: stats.ratingCount,
       minutesListener: stats.minutesListener,
+      gdPoints: stats.gdPoints,
       updatedAt: stats.updatedAt,
       eligibility: computeEligibility(stats),
     });
@@ -537,6 +538,7 @@ export function buildApp(
         avgRating: stats.avgRating,
         ratingCount: stats.ratingCount,
         minutesListener: stats.minutesListener,
+        gdPoints: stats.gdPoints,
         eligibility: computeEligibility(stats),
       },
     });
@@ -612,6 +614,75 @@ export function buildApp(
   // participant list to profile+toggle in one round trip instead of N calls. Looped findById
   // rather than a new bulk repository method -- session participant lists are 2-3 users
   // (poster+resolver today), not worth a new SQL path for.
+  // service-to-service only -- Seminar/GD services need to gate create-seminar/create-gd/join
+  // on the caller's eligibility, but they only ever see the gateway's X-User-Id header, never
+  // the caller's own JWT that /users/me/stats requires. No existing internal route exposed
+  // eligibility for an arbitrary user id, so this is a genuinely new addition rather than reuse.
+  app.get<{ Params: { id: string } }>("/internal/users/:id/eligibility", async (request, reply) => {
+    if (!requireInternalServiceToken(request, reply)) return;
+
+    const { id } = request.params;
+    if (!UUID_PATTERN.test(id)) {
+      return reply.code(400).send({ error: "id must be a valid uuid" });
+    }
+
+    const stats = await statsRepository.findByUserId(id);
+    if (!stats) {
+      return reply.code(404).send({ error: "stats not found" });
+    }
+    return reply.send(computeEligibility(stats));
+  });
+
+  app.post<{ Params: { id: string }; Body: { minutes: number } }>(
+    "/internal/users/:id/stats/increment-minutes-listener",
+    async (request, reply) => {
+      if (!requireInternalServiceToken(request, reply)) return;
+
+      const { id } = request.params;
+      if (!UUID_PATTERN.test(id)) {
+        return reply.code(400).send({ error: "id must be a valid uuid" });
+      }
+
+      const { minutes } = request.body ?? ({} as { minutes: number });
+      if (typeof minutes !== "number" || !Number.isInteger(minutes) || minutes <= 0 || minutes > MAX_MINUTES_RESOLVED_PER_CALL) {
+        return reply.code(400).send({
+          error: `minutes must be a positive integer no greater than ${MAX_MINUTES_RESOLVED_PER_CALL}`,
+        });
+      }
+
+      const newTotal = await statsRepository.incrementMinutesListener(id, minutes);
+      if (newTotal === null) {
+        return reply.code(404).send({ error: "user not found" });
+      }
+      request.log.info({ requestedId: id, minutes }, "minutes_listener incremented via internal call");
+      return reply.send({ minutesListener: newTotal });
+    },
+  );
+
+  app.post<{ Params: { id: string }; Body: { points: number } }>(
+    "/internal/users/:id/stats/increment-gd-points",
+    async (request, reply) => {
+      if (!requireInternalServiceToken(request, reply)) return;
+
+      const { id } = request.params;
+      if (!UUID_PATTERN.test(id)) {
+        return reply.code(400).send({ error: "id must be a valid uuid" });
+      }
+
+      const { points } = request.body ?? ({} as { points: number });
+      if (typeof points !== "number" || !Number.isFinite(points) || points < 0) {
+        return reply.code(400).send({ error: "points must be a non-negative number" });
+      }
+
+      const newTotal = await statsRepository.incrementGdPoints(id, points);
+      if (newTotal === null) {
+        return reply.code(404).send({ error: "user not found" });
+      }
+      request.log.info({ requestedId: id, points }, "gd_points incremented via internal call");
+      return reply.send({ gdPoints: newTotal });
+    },
+  );
+
   app.post<{ Body: BulkUsersBody }>("/internal/users/bulk", async (request, reply) => {
     if (!requireInternalServiceToken(request, reply)) return;
 
