@@ -584,6 +584,7 @@ describe("GET /users/me/stats", () => {
       avgRating: 0,
       ratingCount: 0,
       minutesListener: 0,
+      gdPoints: 0,
       updatedAt: expect.any(String),
       eligibility: { canHostSeminar: false, canOrganizeGD: false, canAttendGD: false },
     });
@@ -751,6 +752,7 @@ describe("GET /users/:id/public", () => {
         avgRating: 0,
         ratingCount: 0,
         minutesListener: 0,
+        gdPoints: 0,
         eligibility: { canHostSeminar: false, canOrganizeGD: false, canAttendGD: false },
       },
     });
@@ -1121,6 +1123,114 @@ describe("POST /internal/users/:id/stats/increment-minutes-resolved", () => {
     });
 
     expect(res.statusCode).toBe(400);
+  });
+});
+
+describe("GET /internal/users/:id/eligibility", () => {
+  const originalInternalToken = process.env.INTERNAL_SERVICE_TOKEN;
+
+  beforeAll(() => {
+    process.env.JWT_SECRET = "test-secret";
+    process.env.INTERNAL_SERVICE_TOKEN = "test-internal-secret";
+  });
+
+  afterAll(() => {
+    process.env.INTERNAL_SERVICE_TOKEN = originalInternalToken;
+  });
+
+  function build() {
+    const userRepo = new InMemoryUserRepository();
+    const statsRepo = new InMemoryStatsRepository();
+    const app = buildApp(new InMemoryOtpStore(), new RecordingEmailSender(), userRepo, undefined, new InMemoryExpertiseRepository(), new FakeMatchingClient(), statsRepo);
+    return { app, userRepo, statsRepo };
+  }
+
+  it("rejects without a valid internal token", async () => {
+    const { app } = build();
+    const res = await app.inject({ method: "GET", url: "/internal/users/00000000-0000-4000-8000-000000000000/eligibility" });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns eligibility for an arbitrary user id, no caller JWT required", async () => {
+    const { app, userRepo, statsRepo } = build();
+    const { user } = await userRepo.findOrCreateByIdentifier("host@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+    await statsRepo.incrementMinutesResolved(user.id, 300);
+    await statsRepo.recordRating(user.id, 4);
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/internal/users/${user.id}/eligibility`,
+      headers: { "x-internal-service-token": "test-internal-secret" },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().canHostSeminar).toBe(true);
+  });
+
+  it("404s for a user with no stats row", async () => {
+    const { app } = build();
+    const res = await app.inject({
+      method: "GET",
+      url: "/internal/users/00000000-0000-4000-8000-000000000000/eligibility",
+      headers: { "x-internal-service-token": "test-internal-secret" },
+    });
+    expect(res.statusCode).toBe(404);
+  });
+});
+
+describe("POST /internal/users/:id/stats/increment-minutes-listener", () => {
+  const originalInternalToken = process.env.INTERNAL_SERVICE_TOKEN;
+  beforeAll(() => {
+    process.env.JWT_SECRET = "test-secret";
+    process.env.INTERNAL_SERVICE_TOKEN = "test-internal-secret";
+  });
+  afterAll(() => {
+    process.env.INTERNAL_SERVICE_TOKEN = originalInternalToken;
+  });
+
+  it("increments minutesListener atomically", async () => {
+    const userRepo = new InMemoryUserRepository();
+    const statsRepo = new InMemoryStatsRepository();
+    const app = buildApp(new InMemoryOtpStore(), new RecordingEmailSender(), userRepo, undefined, new InMemoryExpertiseRepository(), new FakeMatchingClient(), statsRepo);
+    const { user } = await userRepo.findOrCreateByIdentifier("listener@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/internal/users/${user.id}/stats/increment-minutes-listener`,
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { minutes: 50 },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ minutesListener: 50 });
+  });
+});
+
+describe("POST /internal/users/:id/stats/increment-gd-points", () => {
+  const originalInternalToken = process.env.INTERNAL_SERVICE_TOKEN;
+  beforeAll(() => {
+    process.env.JWT_SECRET = "test-secret";
+    process.env.INTERNAL_SERVICE_TOKEN = "test-internal-secret";
+  });
+  afterAll(() => {
+    process.env.INTERNAL_SERVICE_TOKEN = originalInternalToken;
+  });
+
+  it("increments gdPoints atomically", async () => {
+    const userRepo = new InMemoryUserRepository();
+    const statsRepo = new InMemoryStatsRepository();
+    const app = buildApp(new InMemoryOtpStore(), new RecordingEmailSender(), userRepo, undefined, new InMemoryExpertiseRepository(), new FakeMatchingClient(), statsRepo);
+    const { user } = await userRepo.findOrCreateByIdentifier("speaker@example.com", true);
+    await statsRepo.initializeForUser(user.id);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/internal/users/${user.id}/stats/increment-gd-points`,
+      headers: { "x-internal-service-token": "test-internal-secret" },
+      payload: { points: 15 },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ gdPoints: 15 });
   });
 });
 
