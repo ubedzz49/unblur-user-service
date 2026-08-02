@@ -1672,6 +1672,188 @@ describe("admin endpoints", () => {
       expect(res.statusCode).toBe(404);
     });
   });
+
+  function superadminToken() {
+    return signAuthToken("super-1", "superadmin", "boss");
+  }
+
+  describe("admin-users management (Version 9 RBAC)", () => {
+    it("403s a plain-admin token trying to create an admin account", async () => {
+      const app = buildApp();
+      const res = await app.inject({
+        method: "POST",
+        url: "/admin/admin-users",
+        headers: { authorization: `Bearer ${adminToken()}` },
+        payload: { username: "newadmin", password: "supersecret1", role: "admin" },
+      });
+      expect(res.statusCode).toBe(403);
+    });
+
+    it("lets a superadmin create a new admin account", async () => {
+      const app = buildApp();
+      const res = await app.inject({
+        method: "POST",
+        url: "/admin/admin-users",
+        headers: { authorization: `Bearer ${superadminToken()}` },
+        payload: { username: "newadmin", password: "supersecret1", role: "admin" },
+      });
+      expect(res.statusCode).toBe(201);
+      expect(res.json()).toMatchObject({ username: "newadmin", role: "admin" });
+      expect(res.json().passwordHash).toBeUndefined();
+    });
+
+    it("rejects an email-shaped admin username", async () => {
+      const app = buildApp();
+      const res = await app.inject({
+        method: "POST",
+        url: "/admin/admin-users",
+        headers: { authorization: `Bearer ${superadminToken()}` },
+        payload: { username: "admin@example.com", password: "supersecret1", role: "admin" },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it("rejects a short password", async () => {
+      const app = buildApp();
+      const res = await app.inject({
+        method: "POST",
+        url: "/admin/admin-users",
+        headers: { authorization: `Bearer ${superadminToken()}` },
+        payload: { username: "newadmin", password: "short", role: "admin" },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it("rejects a duplicate username", async () => {
+      const app = buildApp();
+      await app.inject({
+        method: "POST",
+        url: "/admin/admin-users",
+        headers: { authorization: `Bearer ${superadminToken()}` },
+        payload: { username: "dupe", password: "supersecret1", role: "admin" },
+      });
+      const res = await app.inject({
+        method: "POST",
+        url: "/admin/admin-users",
+        headers: { authorization: `Bearer ${superadminToken()}` },
+        payload: { username: "dupe", password: "supersecret1", role: "admin" },
+      });
+      expect(res.statusCode).toBe(409);
+    });
+
+    it("lists admin accounts without exposing password hashes", async () => {
+      const app = buildApp();
+      await app.inject({
+        method: "POST",
+        url: "/admin/admin-users",
+        headers: { authorization: `Bearer ${superadminToken()}` },
+        payload: { username: "listed", password: "supersecret1", role: "admin" },
+      });
+      const res = await app.inject({ method: "GET", url: "/admin/admin-users", headers: { authorization: `Bearer ${superadminToken()}` } });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().some((a: { username: string }) => a.username === "listed")).toBe(true);
+      expect(res.json().every((a: Record<string, unknown>) => !("passwordHash" in a))).toBe(true);
+    });
+
+    it("lets a superadmin revoke another admin account", async () => {
+      const app = buildApp();
+      const created = await app.inject({
+        method: "POST",
+        url: "/admin/admin-users",
+        headers: { authorization: `Bearer ${superadminToken()}` },
+        payload: { username: "revokeme", password: "supersecret1", role: "admin" },
+      });
+      const res = await app.inject({
+        method: "DELETE",
+        url: `/admin/admin-users/${created.json().id}`,
+        headers: { authorization: `Bearer ${superadminToken()}` },
+      });
+      expect(res.statusCode).toBe(204);
+    });
+
+    it("refuses to let a superadmin revoke their own account", async () => {
+      const app = buildApp();
+      const res = await app.inject({
+        method: "DELETE",
+        url: "/admin/admin-users/super-1",
+        headers: { authorization: `Bearer ${superadminToken()}` },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+  });
+
+  describe("GET /admin/audit-log", () => {
+    it("401s with no token", async () => {
+      const app = buildApp();
+      const res = await app.inject({ method: "GET", url: "/admin/audit-log" });
+      expect(res.statusCode).toBe(401);
+    });
+
+    it("a plain admin (not just superadmin) can read the audit log", async () => {
+      const app = buildApp();
+      const res = await app.inject({ method: "GET", url: "/admin/audit-log", headers: { authorization: `Bearer ${adminToken()}` } });
+      expect(res.statusCode).toBe(200);
+      expect(Array.isArray(res.json())).toBe(true);
+    });
+
+    it("records an entry when an admin blocks a user", async () => {
+      const userRepo = new InMemoryUserRepository();
+      await userRepo.findOrCreateByIdentifier("toblock@example.com", true);
+      const app = buildApp(undefined, undefined, userRepo);
+
+      await app.inject({
+        method: "POST",
+        url: "/admin/users/block",
+        headers: { authorization: `Bearer ${adminToken()}` },
+        payload: { email: "toblock@example.com" },
+      });
+
+      const res = await app.inject({ method: "GET", url: "/admin/audit-log", headers: { authorization: `Bearer ${adminToken()}` } });
+      const entries = res.json();
+      expect(entries.some((e: { action: string }) => e.action === "block_user")).toBe(true);
+    });
+  });
+
+  describe("POST /internal/admin-audit-log", () => {
+    const originalInternalToken = process.env.INTERNAL_SERVICE_TOKEN;
+    beforeAll(() => {
+      process.env.INTERNAL_SERVICE_TOKEN = "test-internal-secret";
+    });
+    afterAll(() => {
+      process.env.INTERNAL_SERVICE_TOKEN = originalInternalToken;
+    });
+
+    it("rejects without a valid internal token", async () => {
+      const app = buildApp();
+      const res = await app.inject({
+        method: "POST",
+        url: "/internal/admin-audit-log",
+        payload: { adminUserId: "a", adminUsername: "a", action: "refund", targetType: "payment", targetId: "p1" },
+      });
+      expect(res.statusCode).toBe(401);
+    });
+
+    it("lets another service record an audit entry, then it's visible via GET /admin/audit-log", async () => {
+      const app = buildApp();
+      const create = await app.inject({
+        method: "POST",
+        url: "/internal/admin-audit-log",
+        headers: { "x-internal-service-token": "test-internal-secret" },
+        payload: {
+          adminUserId: "admin",
+          adminUsername: "admin",
+          action: "refund_booking",
+          targetType: "booking",
+          targetId: "booking-123",
+          metadata: { paymentId: "pay-1" },
+        },
+      });
+      expect(create.statusCode).toBe(201);
+
+      const list = await app.inject({ method: "GET", url: "/admin/audit-log", headers: { authorization: `Bearer ${adminToken()}` } });
+      expect(list.json().some((e: { action: string }) => e.action === "refund_booking")).toBe(true);
+    });
+  });
 });
 
 describe("log level management", () => {
