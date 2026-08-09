@@ -8,6 +8,7 @@ import { InMemoryExpertiseRepository } from "./expertise/repository.js";
 import { FakeMatchingClient, MatchingClient } from "./matching/client.js";
 import { signAuthToken } from "./jwt.js";
 import { FakeGatewayClient } from "./admin/gateway-client.js";
+import { InMemoryAdminUsersRepository } from "./admin/repository.js";
 
 describe("GET /healthz", () => {
   it("returns ok status", async () => {
@@ -67,6 +68,57 @@ describe("OTP auth flow", () => {
     const app = buildApp();
     const res = await app.inject({ method: "POST", url: "/auth/otp/send", payload: {} });
     expect(res.statusCode).toBe(400);
+  });
+
+  // Regression: admin/superadmin accounts (Version 9 RBAC) live in a separate admin_users
+  // table, keyed by username, with no OTP flow of their own -- they're password-only by design.
+  // An admin typing their username into the default OTP tab used to sail straight through:
+  // otp/send happily "sent" a code nowhere useful, and otp/verify then called
+  // findOrCreateByIdentifier() on that username as if it were a phone number, silently creating
+  // a brand-new, unrelated regular-user account and logging the admin in as *that* instead --
+  // landing them on /feed with zero indication anything had gone wrong. From the outside that's
+  // indistinguishable from "I can't log into the admin dashboard".
+  it("rejects otp/send for an identifier that belongs to an admin account, with an actionable message", async () => {
+    const adminUsersRepo = new InMemoryAdminUsersRepository();
+    await adminUsersRepo.create({ username: "ops-admin", passwordHash: "irrelevant", role: "admin" });
+    const app = buildApp(undefined, undefined, undefined, undefined, undefined, undefined, undefined, adminUsersRepo);
+
+    const res = await app.inject({ method: "POST", url: "/auth/otp/send", payload: { identifier: "ops-admin" } });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toMatch(/use a password/i);
+  });
+
+  it("rejects otp/verify for an admin identifier even if an otp was somehow issued for it", async () => {
+    const otpStore = new InMemoryOtpStore();
+    const adminUsersRepo = new InMemoryAdminUsersRepository();
+    await adminUsersRepo.create({ username: "ops-admin", passwordHash: "irrelevant", role: "admin" });
+    const app = buildApp(otpStore, undefined, undefined, undefined, undefined, undefined, undefined, adminUsersRepo);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/auth/otp/verify",
+      payload: { identifier: "ops-admin", otp: "000000" },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toMatch(/use a password/i);
+  });
+
+  it("a regular identifier that happens to collide with no admin account still works normally", async () => {
+    const adminUsersRepo = new InMemoryAdminUsersRepository();
+    await adminUsersRepo.create({ username: "ops-admin", passwordHash: "irrelevant", role: "admin" });
+    const app = buildApp(undefined, undefined, undefined, undefined, undefined, undefined, undefined, adminUsersRepo);
+
+    const sendRes = await app.inject({ method: "POST", url: "/auth/otp/send", payload: { identifier: "+911234567890" } });
+    expect(sendRes.statusCode).toBe(200);
+    const { otp } = sendRes.json();
+
+    const verifyRes = await app.inject({
+      method: "POST",
+      url: "/auth/otp/verify",
+      payload: { identifier: "+911234567890", otp },
+    });
+    expect(verifyRes.statusCode).toBe(200);
+    expect(verifyRes.json().token).toBeTypeOf("string");
   });
 });
 
