@@ -56,6 +56,18 @@ const BCRYPT_COST_FACTOR = 12;
 // widely-cited practical minimum for password length; short enough not to be user-hostile,
 // long enough to rule out the worst trivially-guessable passwords
 const MIN_PASSWORD_LENGTH = 8;
+
+interface SearchUsersQuery {
+  q?: string;
+  limit?: string;
+}
+const MIN_SEARCH_QUERY_LENGTH = 2;
+const DEFAULT_SEARCH_LIMIT = 10;
+const MAX_SEARCH_LIMIT = 25;
+
+// same slugification convention as PATCH /users/me's default-username generator
+// (generateDefaultUsername in users/repository.ts) -- lowercase letters, digits, and hyphens only
+const USERNAME_PATTERN = /^[a-z0-9][a-z0-9-]{2,29}$/;
 // a bcrypt hash of a password nobody has: used to run bcrypt.compare's full cost even when the
 // looked-up user has no password_hash, so the "user not found" and "user has no password" cases
 // take about as long as the "wrong password" case and don't leak which case occurred via timing
@@ -371,12 +383,27 @@ export function buildApp(
     const userId = await requireAuth(request, reply);
     if (!userId) return;
 
-    const { name, photoUrl, bio, aiNotesAndTranscriptsEnabled } = request.body ?? {};
+    const { name, photoUrl, bio, aiNotesAndTranscriptsEnabled, username } = request.body ?? {};
+
+    if (username !== undefined) {
+      if (!USERNAME_PATTERN.test(username)) {
+        request.log.warn({ userId }, "profile update rejected: invalid username format");
+        return reply
+          .code(400)
+          .send({ error: "username must be 3-30 characters, lowercase letters/numbers/hyphens only" });
+      }
+      if (await userRepository.isUsernameTaken(username, userId)) {
+        request.log.warn({ userId }, "profile update rejected: username already taken");
+        return reply.code(409).send({ error: "that username is already taken" });
+      }
+    }
+
     const updated = await userRepository.updateProfile(userId, {
       name,
       photoUrl,
       bio,
       aiNotesAndTranscriptsEnabled,
+      username,
     });
     if (!updated) {
       request.log.warn({ userId }, "profile update failed: user not found");
@@ -570,6 +597,7 @@ export function buildApp(
     // resolution request decide whether to accept/send
     return reply.send({
       id: user.id,
+      username: user.username,
       name: user.name,
       photoUrl: user.photoUrl,
       bio: user.bio,
@@ -587,6 +615,28 @@ export function buildApp(
         eligibility: computeEligibility(stats),
       },
     });
+  });
+
+  // Searchable typeahead so nothing in the product ever needs someone to type/paste a raw
+  // user-id UUID by hand -- backs the GD vote form and the admin "send notification" picker.
+  // Deliberately just username/name + id/photo, no email/phone -- same privacy bar as the
+  // public-profile route above.
+  app.get<{ Querystring: SearchUsersQuery }>("/users/search", async (request, reply) => {
+    const authedUserId = await requireAuth(request, reply);
+    if (!authedUserId) return;
+
+    const { q } = request.query;
+    if (!q || q.trim().length < MIN_SEARCH_QUERY_LENGTH) {
+      return reply.code(400).send({ error: `q must be at least ${MIN_SEARCH_QUERY_LENGTH} characters` });
+    }
+
+    const rawLimit = Number(request.query.limit ?? DEFAULT_SEARCH_LIMIT);
+    const limit = Number.isFinite(rawLimit)
+      ? Math.min(Math.max(Math.trunc(rawLimit), 1), MAX_SEARCH_LIMIT)
+      : DEFAULT_SEARCH_LIMIT;
+
+    const results = await userRepository.searchUsers(q.trim(), limit);
+    return reply.send(results);
   });
 
   app.post<{ Params: { id: string }; Body: IncrementMinutesResolvedBody }>(

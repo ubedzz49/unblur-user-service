@@ -221,6 +221,106 @@ describe("PATCH /users/me", () => {
     const res = await app.inject({ method: "PATCH", url: "/users/me", payload: { name: "Asha" } });
     expect(res.statusCode).toBe(401);
   });
+
+  it("rejects a malformed username", async () => {
+    const userRepo = new InMemoryUserRepository();
+    const app = buildApp(new InMemoryOtpStore(), new RecordingEmailSender(), userRepo);
+    const { user } = await userRepo.findOrCreateByIdentifier("student@example.com", true);
+    const token = signAuthToken(user.id);
+
+    const res = await app.inject({
+      method: "PATCH",
+      url: "/users/me",
+      headers: { authorization: `Bearer ${token}` },
+      payload: { username: "AB" }, // too short, also uppercase
+    });
+
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects a username already taken by someone else", async () => {
+    const userRepo = new InMemoryUserRepository();
+    const app = buildApp(new InMemoryOtpStore(), new RecordingEmailSender(), userRepo);
+    const { user: first } = await userRepo.findOrCreateByIdentifier("first@example.com", true);
+    const { user: second } = await userRepo.findOrCreateByIdentifier("second@example.com", true);
+    await userRepo.updateProfile(first.id, { username: "asha-tutor" });
+    const token = signAuthToken(second.id);
+
+    const res = await app.inject({
+      method: "PATCH",
+      url: "/users/me",
+      headers: { authorization: `Bearer ${token}` },
+      payload: { username: "asha-tutor" },
+    });
+
+    expect(res.statusCode).toBe(409);
+  });
+
+  it("lets a user re-save their own current username unchanged", async () => {
+    const userRepo = new InMemoryUserRepository();
+    const app = buildApp(new InMemoryOtpStore(), new RecordingEmailSender(), userRepo);
+    const { user } = await userRepo.findOrCreateByIdentifier("student@example.com", true);
+    const token = signAuthToken(user.id);
+
+    const res = await app.inject({
+      method: "PATCH",
+      url: "/users/me",
+      headers: { authorization: `Bearer ${token}` },
+      payload: { username: user.username, bio: "updated" },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().username).toBe(user.username);
+  });
+});
+
+describe("GET /users/search", () => {
+  beforeAll(() => {
+    process.env.JWT_SECRET = "test-secret";
+  });
+
+  it("finds a user by username substring, excludes blocked users, and never leaks email/phone", async () => {
+    const userRepo = new InMemoryUserRepository();
+    const app = buildApp(new InMemoryOtpStore(), new RecordingEmailSender(), userRepo);
+    const { user: caller } = await userRepo.findOrCreateByIdentifier("caller@example.com", true);
+    const { user: target } = await userRepo.findOrCreateByIdentifier("target@example.com", true);
+    await userRepo.updateProfile(target.id, { username: "asha-tutor", name: "Asha" });
+    const { user: blocked } = await userRepo.findOrCreateByIdentifier("blocked@example.com", true);
+    await userRepo.updateProfile(blocked.id, { username: "asha-blocked" });
+    await userRepo.blockByEmail("blocked@example.com");
+    const token = signAuthToken(caller.id);
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/users/search?q=asha",
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body).toEqual([{ id: target.id, username: "asha-tutor", name: "Asha", photoUrl: null }]);
+  });
+
+  it("rejects a query shorter than 2 characters", async () => {
+    const userRepo = new InMemoryUserRepository();
+    const app = buildApp(new InMemoryOtpStore(), new RecordingEmailSender(), userRepo);
+    const { user: caller } = await userRepo.findOrCreateByIdentifier("caller@example.com", true);
+    const token = signAuthToken(caller.id);
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/users/search?q=a",
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects with no token", async () => {
+    const app = buildApp();
+    const res = await app.inject({ method: "GET", url: "/users/search?q=asha" });
+    expect(res.statusCode).toBe(401);
+  });
 });
 
 describe("POST /users/me/photo-upload-url", () => {
@@ -744,6 +844,7 @@ describe("GET /users/:id/public", () => {
     const body = res.json();
     expect(body).toEqual({
       id: target.id,
+      username: target.username,
       name: "Asha",
       photoUrl: "https://cdn/asha.png",
       bio: "I help with CAT quant",

@@ -1,7 +1,8 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, randomBytes } from "node:crypto";
 
 export interface User {
   id: string;
+  username: string;
   email: string | null;
   phone: string | null;
   name: string | null;
@@ -12,11 +13,40 @@ export interface User {
   createdAt: string;
 }
 
+// what a searchable-dropdown typeahead needs and nothing more -- no email/phone, this is shown
+// to other end users (e.g. picking a GD vote recipient or an admin picking who to notify), not
+// just admins
+export interface UserSearchResult {
+  id: string;
+  username: string;
+  name: string | null;
+  photoUrl: string | null;
+}
+
 export interface ProfileUpdate {
   name?: string;
   photoUrl?: string;
   bio?: string;
   aiNotesAndTranscriptsEnabled?: boolean;
+  username?: string;
+}
+
+// Matches the slugification convention used by src/expertise/repository.ts's slugify() and the
+// 012_usernames.sql backfill: lowercase, non-alphanumeric runs collapsed to a single hyphen, no
+// leading/trailing hyphens. A short random suffix breaks collisions on auto-generated usernames
+// (chosen ones from PATCH /users/me go through uniqueness-checked repository calls instead).
+export function slugifyUsername(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+export function generateDefaultUsername(seed: string): string {
+  const base = slugifyUsername(seed.split("@")[0]) || "user";
+  const suffix = randomBytes(3).toString("hex");
+  return `${base}-${suffix}`;
 }
 
 export interface FindOrCreateResult {
@@ -35,12 +65,18 @@ export interface UserRepository {
   findOrCreateByIdentifier(identifier: string, isEmail: boolean): Promise<FindOrCreateResult>;
   findById(id: string): Promise<User | null>;
   updateProfile(id: string, update: ProfileUpdate): Promise<User | null>;
-  // identifier is email or phone, same lookup semantics as findOrCreateByIdentifier but
-  // read-only and includes the password fields needed for POST /auth/password/login
+  // identifier can be a username, email, or phone (tried in that order) -- same read-only
+  // shape as findOrCreateByIdentifier's password fields, used by POST /auth/password/login
   findByIdentifierWithPassword(identifier: string): Promise<UserPasswordInfo | null>;
   // needed by POST /users/me/password to check the caller's current password before changing it
   findPasswordInfoById(userId: string): Promise<UserPasswordInfo | null>;
   setPassword(userId: string, passwordHash: string, mustResetPassword: boolean): Promise<void>;
+  // true if some OTHER user already has this username (case-insensitive) -- excludeUserId lets
+  // PATCH /users/me re-save a profile without tripping over the caller's own current username
+  isUsernameTaken(username: string, excludeUserId?: string): Promise<boolean>;
+  // typeahead backing GET /users/search -- matches on username or name, case-insensitive,
+  // excludes blocked accounts (nothing should let you pick a blocked user out of a dropdown)
+  searchUsers(query: string, limit: number): Promise<UserSearchResult[]>;
 
   // admin-only
   listUsers(limit: number, offset: number): Promise<User[]>;
@@ -52,6 +88,7 @@ export interface UserRepository {
 export class InMemoryUserRepository implements UserRepository {
   private usersById = new Map<string, User>();
   private idsByIdentifier = new Map<string, string>();
+  private idsByUsername = new Map<string, string>(); // keyed lowercase
   private passwordsById = new Map<string, { passwordHash: string | null; mustResetPassword: boolean }>();
 
   async findOrCreateByIdentifier(identifier: string, isEmail: boolean): Promise<FindOrCreateResult> {
@@ -61,8 +98,13 @@ export class InMemoryUserRepository implements UserRepository {
     // real uuid, not a placeholder string -- some endpoints (GET /users/:id/public) validate
     // the id looks like a real uuid before querying, so tests need a realistic shape here too
     const id = randomUUID();
+    let username = generateDefaultUsername(identifier);
+    while (this.idsByUsername.has(username.toLowerCase())) {
+      username = generateDefaultUsername(identifier);
+    }
     const user: User = {
       id,
+      username,
       email: isEmail ? identifier : null,
       phone: isEmail ? null : identifier,
       name: null,
@@ -74,6 +116,7 @@ export class InMemoryUserRepository implements UserRepository {
     };
     this.usersById.set(id, user);
     this.idsByIdentifier.set(identifier, id);
+    this.idsByUsername.set(username.toLowerCase(), id);
     this.passwordsById.set(id, { passwordHash: null, mustResetPassword: false });
     return { user, isNew: true };
   }
@@ -83,7 +126,7 @@ export class InMemoryUserRepository implements UserRepository {
   }
 
   async findByIdentifierWithPassword(identifier: string): Promise<UserPasswordInfo | null> {
-    const id = this.idsByIdentifier.get(identifier);
+    const id = this.idsByUsername.get(identifier.toLowerCase()) ?? this.idsByIdentifier.get(identifier);
     if (!id) return null;
     const pw = this.passwordsById.get(id) ?? { passwordHash: null, mustResetPassword: false };
     return {
@@ -92,6 +135,19 @@ export class InMemoryUserRepository implements UserRepository {
       mustResetPassword: pw.mustResetPassword,
       blockedAt: this.usersById.get(id)?.blockedAt ?? null,
     };
+  }
+
+  async isUsernameTaken(username: string, excludeUserId?: string): Promise<boolean> {
+    const id = this.idsByUsername.get(username.toLowerCase());
+    return id !== undefined && id !== excludeUserId;
+  }
+
+  async searchUsers(query: string, limit: number): Promise<UserSearchResult[]> {
+    const q = query.toLowerCase();
+    return Array.from(this.usersById.values())
+      .filter((u) => !u.blockedAt && (u.username.toLowerCase().includes(q) || (u.name ?? "").toLowerCase().includes(q)))
+      .slice(0, limit)
+      .map((u) => ({ id: u.id, username: u.username, name: u.name, photoUrl: u.photoUrl }));
   }
 
   async findPasswordInfoById(userId: string): Promise<UserPasswordInfo | null> {
@@ -125,7 +181,12 @@ export class InMemoryUserRepository implements UserRepository {
       photoUrl: update.photoUrl ?? user.photoUrl,
       bio: update.bio ?? user.bio,
       aiNotesAndTranscriptsEnabled: update.aiNotesAndTranscriptsEnabled ?? user.aiNotesAndTranscriptsEnabled,
+      username: update.username ?? user.username,
     };
+    if (update.username && update.username.toLowerCase() !== user.username.toLowerCase()) {
+      this.idsByUsername.delete(user.username.toLowerCase());
+      this.idsByUsername.set(update.username.toLowerCase(), id);
+    }
     this.usersById.set(id, updated);
     return updated;
   }

@@ -43,6 +43,24 @@ describe("password login and password management", () => {
     expect(verifyAuthToken(body.token).sub).toBe(user.id);
   });
 
+  it("logs in with the username instead of the email, case-insensitively", async () => {
+    const userRepo = new InMemoryUserRepository();
+    const user = await createUser(userRepo);
+    await userRepo.updateProfile(user.id, { username: "asha-tutor" });
+    const hash = await bcrypt.hash("correct-horse-battery", BCRYPT_COST_FACTOR);
+    userRepo.seedPassword(user.id, hash, false);
+
+    const app = buildApp(undefined, undefined, userRepo);
+    const res = await app.inject({
+      method: "POST",
+      url: "/auth/password/login",
+      payload: { identifier: "ASHA-TUTOR", password: "correct-horse-battery" },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(verifyAuthToken(res.json().token).sub).toBe(user.id);
+  });
+
   it("rejects login with the wrong password", async () => {
     const userRepo = new InMemoryUserRepository();
     const user = await createUser(userRepo);
