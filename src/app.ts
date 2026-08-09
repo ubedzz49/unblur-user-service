@@ -269,6 +269,20 @@ export function buildApp(
       return reply.code(400).send({ error: "identifier is required" });
     }
 
+    // Admin/superadmin accounts (Version 9 RBAC, admin_users table) have no OTP flow at all --
+    // they're a separate auth realm, password-only by design. Without this check, an admin
+    // typing their username into the default OTP login tab would silently fall through to
+    // findOrCreateByIdentifier() in /auth/otp/verify and get a brand-new, garbage regular-user
+    // account created for them (their username treated as a bogus "phone number"), landing them
+    // on the normal feed with no indication anything went wrong -- which is exactly what "I can't
+    // log into the admin dashboard" looks like from the outside. Reject early instead, with a
+    // message that actually points at the fix.
+    const adminAccount = await adminUsersRepository.findByUsername(identifier);
+    if (adminAccount) {
+      request.log.warn("otp send rejected: identifier belongs to an admin account");
+      return reply.code(400).send({ error: "Admin accounts sign in with a password, not a code -- use \"Use a password\" on the login page." });
+    }
+
     const isEmail = EMAIL_PATTERN.test(identifier);
     const { otp } = await otpService.send(identifier);
 
@@ -296,6 +310,14 @@ export function buildApp(
     if (!identifier || !otp) {
       request.log.warn("otp verify rejected: missing identifier or otp");
       return reply.code(400).send({ error: "identifier and otp are required" });
+    }
+
+    // defense in depth -- /auth/otp/send already rejects admin identifiers before an otp is ever
+    // issued for one, but verify shouldn't rely solely on send having been called first
+    const adminAccount = await adminUsersRepository.findByUsername(identifier);
+    if (adminAccount) {
+      request.log.warn("otp verify rejected: identifier belongs to an admin account");
+      return reply.code(400).send({ error: "Admin accounts sign in with a password, not a code -- use \"Use a password\" on the login page." });
     }
 
     const isValid = await otpService.verify(identifier, otp);
