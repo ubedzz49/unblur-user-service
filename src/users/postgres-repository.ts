@@ -1,8 +1,17 @@
 import { Pool } from "pg";
-import { FindOrCreateResult, ProfileUpdate, User, UserPasswordInfo, UserRepository } from "./repository.js";
+import {
+  FindOrCreateResult,
+  ProfileUpdate,
+  User,
+  UserPasswordInfo,
+  UserRepository,
+  UserSearchResult,
+  generateDefaultUsername,
+} from "./repository.js";
 
 interface UserRow {
   id: string;
+  username: string;
   email: string | null;
   phone: string | null;
   name: string | null;
@@ -16,6 +25,7 @@ interface UserRow {
 function toUser(row: UserRow): User {
   return {
     id: row.id,
+    username: row.username,
     email: row.email,
     phone: row.phone,
     name: row.name,
@@ -39,11 +49,20 @@ export class PostgresUserRepository implements UserRepository {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
+      // generate-and-retry rather than a single guess: collisions are rare (6 random hex bytes)
+      // but the unique index means we must handle one anyway, not just hope it never happens
+      let username = generateDefaultUsername(identifier);
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const taken = await client.query("SELECT 1 FROM users WHERE lower(username) = lower($1)", [username]);
+        if (taken.rows.length === 0) break;
+        username = generateDefaultUsername(identifier);
+      }
+
       // ON CONFLICT DO NOTHING -- two concurrent first-time logins for the same identifier
       // can both reach here past the SELECT above; only one insert should win
       const inserted = await client.query<UserRow>(
-        `INSERT INTO users (${column}) VALUES ($1) ON CONFLICT (${column}) DO NOTHING RETURNING *`,
-        [identifier],
+        `INSERT INTO users (${column}, username) VALUES ($1, $2) ON CONFLICT (${column}) DO NOTHING RETURNING *`,
+        [identifier, username],
       );
       if (inserted.rows.length > 0) {
         // every user needs a stats row from day one -- same transaction so we never end up
@@ -79,15 +98,62 @@ export class PostgresUserRepository implements UserRepository {
          photo_url = COALESCE($3, photo_url),
          bio = COALESCE($4, bio),
          ai_notes_and_transcripts_enabled = COALESCE($5, ai_notes_and_transcripts_enabled),
+         username = COALESCE($6, username),
          updated_at = now()
        WHERE id = $1
        RETURNING *`,
-      [id, update.name ?? null, update.photoUrl ?? null, update.bio ?? null, update.aiNotesAndTranscriptsEnabled ?? null],
+      [
+        id,
+        update.name ?? null,
+        update.photoUrl ?? null,
+        update.bio ?? null,
+        update.aiNotesAndTranscriptsEnabled ?? null,
+        update.username ?? null,
+      ],
     );
     return result.rows.length > 0 ? toUser(result.rows[0]) : null;
   }
 
+  async isUsernameTaken(username: string, excludeUserId?: string): Promise<boolean> {
+    const result = await this.pool.query(
+      "SELECT 1 FROM users WHERE lower(username) = lower($1) AND id != COALESCE($2, '00000000-0000-0000-0000-000000000000')",
+      [username, excludeUserId ?? null],
+    );
+    return result.rows.length > 0;
+  }
+
+  async searchUsers(query: string, limit: number): Promise<UserSearchResult[]> {
+    const result = await this.pool.query<{ id: string; username: string; name: string | null; photo_url: string | null }>(
+      `SELECT id, username, name, photo_url FROM users
+       WHERE blocked_at IS NULL AND (username ILIKE $1 OR name ILIKE $1)
+       ORDER BY username ASC
+       LIMIT $2`,
+      [`%${query}%`, limit],
+    );
+    return result.rows.map((r) => ({ id: r.id, username: r.username, name: r.name, photoUrl: r.photo_url }));
+  }
+
   async findByIdentifierWithPassword(identifier: string): Promise<UserPasswordInfo | null> {
+    // tries username first (case-insensitive), then falls back to email/phone -- lets a user log
+    // in with any of the three without the caller needing to know which kind of identifier it is
+    const byUsername = await this.pool.query<{
+      id: string;
+      password_hash: string | null;
+      must_reset_password: boolean;
+      blocked_at: string | null;
+    }>("SELECT id, password_hash, must_reset_password, blocked_at FROM users WHERE lower(username) = lower($1)", [
+      identifier,
+    ]);
+    if (byUsername.rows.length > 0) {
+      const row = byUsername.rows[0];
+      return {
+        id: row.id,
+        passwordHash: row.password_hash,
+        mustResetPassword: row.must_reset_password,
+        blockedAt: row.blocked_at,
+      };
+    }
+
     const isEmail = identifier.includes("@");
     const column = isEmail ? "email" : "phone";
     const result = await this.pool.query<{
