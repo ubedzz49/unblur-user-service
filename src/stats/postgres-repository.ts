@@ -1,5 +1,5 @@
 import { Pool } from "pg";
-import { StatsRepository, UserStats } from "./repository.js";
+import { ResolverLeaderboardRow, StatsRepository, UserStats } from "./repository.js";
 
 interface StatsRow {
   user_id: string;
@@ -84,5 +84,31 @@ export class PostgresStatsRepository implements StatsRepository {
       [userId, points],
     );
     return result.rows.length > 0 ? Number(result.rows[0].gd_points) : null;
+  }
+
+  async topResolvers(limit: number): Promise<ResolverLeaderboardRow[]> {
+    const result = await this.pool.query<{
+      user_id: string;
+      name: string | null;
+      minutes_resolved: number;
+      avg_rating: string;
+      rating_count: number;
+      gd_points: string;
+    }>(
+      `SELECT s.user_id, u.name, s.minutes_resolved, s.avg_rating, s.rating_count, s.gd_points
+       FROM user_stats s
+       JOIN users u ON u.id = s.user_id
+       ORDER BY s.minutes_resolved DESC
+       LIMIT $1`,
+      [limit],
+    );
+    return result.rows.map((r) => ({
+      userId: r.user_id,
+      name: r.name,
+      minutesResolved: r.minutes_resolved,
+      avgRating: Number(r.avg_rating),
+      ratingCount: r.rating_count,
+      gdPoints: Number(r.gd_points),
+    }));
   }
 }

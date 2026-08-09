@@ -22,6 +22,18 @@ export interface StatsRepository {
   incrementMinutesListener(userId: string, minutes: number): Promise<number | null>;
   // atomic add -- feeds the communication score shown on the profile after GD voting
   incrementGdPoints(userId: string, points: number): Promise<number | null>;
+  // admin dashboard: resolver leaderboard, ranked by minutes resolved, joined with the
+  // user's name for display -- read-only, no new schema.
+  topResolvers(limit: number): Promise<ResolverLeaderboardRow[]>;
+}
+
+export interface ResolverLeaderboardRow {
+  userId: string;
+  name: string | null;
+  minutesResolved: number;
+  avgRating: number;
+  ratingCount: number;
+  gdPoints: number;
 }
 
 // test-only -- avoids CI needing a real Postgres instance
@@ -86,5 +98,19 @@ export class InMemoryStatsRepository implements StatsRepository {
     const updated = { ...existing, gdPoints: existing.gdPoints + points, updatedAt: new Date().toISOString() };
     this.statsByUserId.set(userId, updated);
     return updated.gdPoints;
+  }
+
+  async topResolvers(limit: number): Promise<ResolverLeaderboardRow[]> {
+    return Array.from(this.statsByUserId.values())
+      .sort((a, b) => b.minutesResolved - a.minutesResolved)
+      .slice(0, limit)
+      .map((s) => ({
+        userId: s.userId,
+        name: null,
+        minutesResolved: s.minutesResolved,
+        avgRating: s.avgRating,
+        ratingCount: s.ratingCount,
+        gdPoints: s.gdPoints,
+      }));
   }
 }
