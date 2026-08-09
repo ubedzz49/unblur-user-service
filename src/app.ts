@@ -50,6 +50,11 @@ interface SetPasswordBody {
   newPassword: string;
 }
 
+interface OtpPasswordResetBody {
+  otp: string;
+  newPassword: string;
+}
+
 // bcrypt cost factor -- 12 is a reasonable default for interactive login in 2026 hardware terms,
 // comfortably above the "don't go below 10" floor without making login noticeably slow
 const BCRYPT_COST_FACTOR = 12;
@@ -448,6 +453,50 @@ export function buildApp(
     const newHash = await bcrypt.hash(newPassword, BCRYPT_COST_FACTOR);
     await userRepository.setPassword(userId, newHash, false);
     request.log.info({ userId }, "password set");
+    return reply.send({ ok: true });
+  });
+
+  // Alternative to POST /users/me/password for a caller who doesn't want to type their current
+  // password -- proves identity via a fresh OTP (POST /auth/otp/send against their own
+  // email/phone) instead. Still requires being logged in (bearer token) so this can't be used
+  // to take over an account purely from a leaked OTP; it only changes password for whoever the
+  // token already belongs to.
+  app.post<{ Body: OtpPasswordResetBody }>("/users/me/password/otp", async (request, reply) => {
+    const userId = await requireAuth(request, reply);
+    if (!userId) return;
+
+    const { otp, newPassword } = request.body ?? {};
+    if (!newPassword || newPassword.length < MIN_PASSWORD_LENGTH) {
+      request.log.warn({ userId }, "otp password reset rejected: newPassword too short");
+      return reply.code(400).send({ error: `newPassword must be at least ${MIN_PASSWORD_LENGTH} characters` });
+    }
+    if (!otp) {
+      request.log.warn({ userId }, "otp password reset rejected: missing otp");
+      return reply.code(400).send({ error: "otp is required" });
+    }
+
+    const user = await userRepository.findById(userId);
+    if (!user) {
+      request.log.warn({ userId }, "otp password reset failed: user not found");
+      return reply.code(404).send({ error: "user not found" });
+    }
+    const identifier = user.email ?? user.phone;
+    if (!identifier) {
+      // shouldn't happen -- every user has at least one of email/phone by the
+      // users_email_or_phone_present check constraint -- but guard anyway
+      request.log.warn({ userId }, "otp password reset failed: no email or phone on file");
+      return reply.code(409).send({ error: "no email or phone on file to send an otp to" });
+    }
+
+    const isValid = await otpService.verify(identifier, otp);
+    if (!isValid) {
+      request.log.warn({ userId }, "otp password reset rejected: invalid or expired otp");
+      return reply.code(401).send({ error: "invalid or expired otp" });
+    }
+
+    const newHash = await bcrypt.hash(newPassword, BCRYPT_COST_FACTOR);
+    await userRepository.setPassword(userId, newHash, false);
+    request.log.info({ userId }, "password reset via otp");
     return reply.send({ ok: true });
   });
 
