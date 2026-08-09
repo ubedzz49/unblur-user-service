@@ -115,8 +115,11 @@ export class PostgresUserRepository implements UserRepository {
   }
 
   async isUsernameTaken(username: string, excludeUserId?: string): Promise<boolean> {
+    // both sides of COALESCE must be the same type -- without the explicit ::uuid casts, the
+    // untyped '00000000...' literal forces $2 to resolve as text, and `id != text` has no
+    // operator for a uuid column (Postgres error 42883). Cast both sides to uuid explicitly.
     const result = await this.pool.query(
-      "SELECT 1 FROM users WHERE lower(username) = lower($1) AND id != COALESCE($2, '00000000-0000-0000-0000-000000000000')",
+      "SELECT 1 FROM users WHERE lower(username) = lower($1) AND id != COALESCE($2::uuid, '00000000-0000-0000-0000-000000000000'::uuid)",
       [username, excludeUserId ?? null],
     );
     return result.rows.length > 0;
