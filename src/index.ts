@@ -13,6 +13,7 @@ import { requireInternalServiceTokenConfigured } from "./internal-auth.js";
 import { PostgresAdminUsersRepository } from "./admin/postgres-repository.js";
 import { PostgresAuditLogRepository } from "./admin/postgres-audit-log-repository.js";
 import { HttpGatewayClient } from "./admin/gateway-client.js";
+import { HttpLogLevelClient } from "./admin/log-level-client.js";
 
 const port = Number(process.env.PORT ?? 3000);
 const dbPool = buildDbPool();
@@ -53,6 +54,7 @@ runMigrations(dbPool)
       adminUsersRepository,
       new PostgresAuditLogRepository(dbPool),
       new HttpGatewayClient(),
+      new HttpLogLevelClient(),
     );
 
     return app.listen({ port, host: "0.0.0.0" }).then(() => app.log.info({ port }, "user-service listening"));

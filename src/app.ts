@@ -23,6 +23,7 @@ import { logger } from "./logger.js";
 import { AdminRole, AdminUsersRepository, InMemoryAdminUsersRepository } from "./admin/repository.js";
 import { AuditLogRepository, InMemoryAuditLogRepository } from "./admin/audit-log-repository.js";
 import { GatewayClient, FakeGatewayClient, RouteConfig } from "./admin/gateway-client.js";
+import { LogLevelClient, FakeLogLevelClient } from "./admin/log-level-client.js";
 
 interface BulkUsersBody {
   userIds?: string[];
@@ -214,6 +215,7 @@ export function buildApp(
   adminUsersRepository: AdminUsersRepository = new InMemoryAdminUsersRepository(),
   auditLogRepository: AuditLogRepository = new InMemoryAuditLogRepository(),
   gatewayClient: GatewayClient = new FakeGatewayClient(),
+  logLevelClient: LogLevelClient = new FakeLogLevelClient(),
 ): FastifyInstance {
   // request/response logging is off during tests to keep test output readable -- level
   // otherwise configurable via LOG_LEVEL (info by default) and mutable at runtime, see
@@ -975,6 +977,57 @@ export function buildApp(
       request.log.error({ err }, "failed to update gateway routes");
       return reply.code(502).send({ error: err instanceof Error ? err.message : "couldn't update gateway routes" });
     }
+  });
+
+  // admin dashboard: runtime log-level control across every backend service, proxied the same
+  // way gateway-routes is -- the browser never sees the internal service token.
+  app.get("/admin/log-level", async (request, reply) => {
+    if (!(await requireAdminAuth(request, reply))) return;
+    const services = logLevelClient.listServices();
+    const levels = await Promise.all(
+      services.map(async (service) => {
+        try {
+          return { service, level: await logLevelClient.getLevel(service) };
+        } catch (err) {
+          request.log.warn({ err, service }, "failed to fetch log level");
+          return { service, level: null, error: "unreachable" };
+        }
+      }),
+    );
+    return reply.send(levels);
+  });
+
+  app.post<{ Body: { service?: string; level?: string } }>("/admin/log-level", async (request, reply) => {
+    if (!(await requireAdminAuth(request, reply))) return;
+    const { service, level } = request.body ?? {};
+    if (!service || !level || !["info", "debug", "error"].includes(level)) {
+      return reply.code(400).send({ error: "service and level (info|debug|error) are required" });
+    }
+    try {
+      const updated = await logLevelClient.setLevel(service, level);
+      const admin = adminContextFrom(request);
+      await auditLogRepository.create({
+        adminUserId: admin.adminUserId,
+        adminUsername: admin.username,
+        action: "set_log_level",
+        targetType: "service",
+        targetId: service,
+        metadata: { level: updated },
+      });
+      request.log.info({ service, level: updated }, "log level changed by admin");
+      return reply.send({ service, level: updated });
+    } catch (err) {
+      request.log.error({ err, service }, "failed to set log level");
+      return reply.code(502).send({ error: err instanceof Error ? err.message : "couldn't reach that service" });
+    }
+  });
+
+  // admin dashboard: resolver leaderboard, read straight off user_stats -- no new schema.
+  app.get<{ Querystring: { limit?: string } }>("/admin/reports/resolver-leaderboard", async (request, reply) => {
+    if (!(await requireAdminAuth(request, reply))) return;
+    const limit = Math.min(Number(request.query.limit) || 20, 100);
+    const rows = await statsRepository.topResolvers(limit);
+    return reply.send(rows);
   });
 
   // shared by both admin expertise routes below -- same find-or-create + best-effort embed
